@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.IPackageManager
+import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.content.pm.ParceledListSlice
 import android.content.pm.ResolveInfo
@@ -559,4 +560,26 @@ object Packages {
             SystemLogger.warning("getPackagesForUid($uid) failed", e)
             emptyArray()
         }
+
+    /**
+     * [pkg] in [userId] with current signing certificates. Flags match official keystore
+     * AttestationApplicationId construction (current signer, not rotation history).
+     */
+    fun packageInfoWithSigners(pkg: String, userId: Int): PackageInfo? {
+        // AOSP KeyAttestationApplicationIdProviderService (API 30): GET_SIGNATURES only.
+        val flags = PackageManager.GET_SIGNATURES
+        if (userId == 0) {
+            return try {
+                pm.getPackageInfo(pkg, flags)
+            } catch (e: Exception) {
+                SystemLogger.warning("packageInfoWithSigners($pkg, user 0) failed", e)
+                null
+            }
+        }
+        val ipm = packageManagerService() ?: return null
+        val flagsL = flags.toLong()
+        return callBothArities("getPackageInfo($pkg, signers, user $userId)") { wide ->
+            if (wide) ipm.getPackageInfo(pkg, flagsL, userId) else ipm.getPackageInfo(pkg, flags, userId)
+        }
+    }
 }

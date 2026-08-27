@@ -150,6 +150,9 @@ struct ProfileStorage {
   std::vector<int32_t> uids;
   std::vector<std::string> uid_pkg_strings;
   std::vector<const char *> uid_pkg_ptrs;
+  std::vector<std::vector<uint8_t>> uid_app_id_bufs;
+  std::vector<const uint8_t *> uid_app_id_ptrs;
+  std::vector<size_t> uid_app_id_lens;
   std::string brand, device, product, serial, imei, imei2, meid, manufacturer, model;
   TsDeviceIds ids{};
   bool has_ids = false;
@@ -254,6 +257,25 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       s.uid_pkg_strings.resize(s.uids.size());
       s.uid_pkg_ptrs.reserve(s.uid_pkg_strings.size());
       for (const auto &p : s.uid_pkg_strings) s.uid_pkg_ptrs.push_back(p.c_str());
+      // uidAppIds[] is parallel to uids[]; empty / missing means keystore1 synthesises from uidPackages.
+      if (const tjson::Value *uid_app_ids = pj.get("uidAppIds")) {
+        for (size_t j = 0; j < uid_app_ids->size(); ++j) {
+          std::vector<uint8_t> der;
+          const std::string b64 = uid_app_ids->at(j).as_string();
+          if (!b64.empty() && !Base64Decode(b64, der)) {
+            LOGE("control: profile %s uidAppIds[%zu] is not base64", s.id.c_str(), j);
+            der.clear();
+          }
+          s.uid_app_id_bufs.push_back(std::move(der));
+        }
+      }
+      s.uid_app_id_bufs.resize(s.uids.size());
+      s.uid_app_id_ptrs.reserve(s.uid_app_id_bufs.size());
+      s.uid_app_id_lens.reserve(s.uid_app_id_bufs.size());
+      for (const auto &der : s.uid_app_id_bufs) {
+        s.uid_app_id_ptrs.push_back(der.empty() ? nullptr : der.data());
+        s.uid_app_id_lens.push_back(der.size());
+      }
       if (const tjson::Value *ids = pj.get("deviceIds")) s.has_ids = FillDeviceIds(*ids, s);
 
       TsProfile tp{};
@@ -275,6 +297,8 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       tp.uids = s.uids.data();
       tp.n_uids = static_cast<int>(s.uids.size());
       tp.uid_packages = s.uid_pkg_ptrs.data();
+      tp.uid_app_ids = s.uid_app_id_ptrs.empty() ? nullptr : s.uid_app_id_ptrs.data();
+      tp.uid_app_id_lens = s.uid_app_id_lens.empty() ? nullptr : s.uid_app_id_lens.data();
 
       if (teesim_cfg_add_profile(&tp)) ++applied;
     }

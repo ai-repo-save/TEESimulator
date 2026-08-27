@@ -1,11 +1,12 @@
 // Handler for intercepted IKeystoreService transactions (Android 10/11).
 //
 // Full simulation via the reference TA: a target app's key never touches the real
-// keymaster. We generate the key pair ourselves, hand back its public key, and at
-// attestKey time import that key into the TA with the app's challenge so the TA
-// issues a keybox-signed attestation over it. The same imported key backs the
-// crypto lifecycle — begin/update/finish/abort run against the TA operation, so the
-// key is usable for signing, not just attestation. Non-target callers are forwarded.
+// keymaster. generateKey always mints in the TA (teesim_km_generate_key) so the
+// callback KeyCharacteristics are the TA's software/tee lists, not a replay of
+// the request. A11 GMS generateKey has no challenge; attestKey re-issues the
+// chain on that blob. The daemon-supplied AttestationApplicationId is attached
+// when the caller's own blob was dropped by this hook. The TA blob backs
+// begin/update/finish/abort. Non-target callers are forwarded.
 //
 // The service methods deliver their results by transacting back on a callback
 // binder passed in the request; the transaction's own reply is just a status.
@@ -24,6 +25,7 @@
 #include <openssl/rsa.h>
 #include <openssl/x509.h>
 
+#include <algorithm>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
@@ -46,10 +48,12 @@ using namespace android;
 // answer getKeyCharacteristics as if it were generateKey while the real generateKey
 // (one ordinal lower) runs untouched in keystore. Selected from the API level below.
 struct TxCodes {
-  uint32_t generateKey, getKeyCharacteristics, exportKey, attestKey, begin, update, finish, abort;
+  // del/exist sit before reset() in the AIDL, so their ordinals do not shift on R.
+  uint32_t del, exist, generateKey, getKeyCharacteristics, exportKey, attestKey, begin, update,
+      finish, abort;
 };
-constexpr TxCodes kTxQ = {18, 19, 21, 29, 22, 23, 24, 25};  // Android 10 (API 29)
-constexpr TxCodes kTxR = {17, 18, 20, 28, 21, 22, 23, 24};  // Android 11 (API 30)
+constexpr TxCodes kTxQ = {4, 5, 18, 19, 21, 29, 22, 23, 24, 25};  // Android 10 (API 29)
+constexpr TxCodes kTxR = {4, 5, 17, 18, 20, 28, 21, 22, 23, 24};  // Android 11 (API 30)
 
 // True on Android 11+. Besides the ordinal shift, R inserted a `byte[] input` before
 // `signature` in finish(), so the two releases also parse that request differently.
@@ -73,13 +77,14 @@ enum {
   TAG_CREATION_DATETIME = 0x600002bd,            // 0x60000000 | 701
   TAG_ATTESTATION_CHALLENGE = 0x900002c4,        // 0x90000000 | 708
   TAG_ATTESTATION_APPLICATION_ID = 0x900002c5,   // 0x90000000 | 709
-  TAG_CERTIFICATE_NOT_BEFORE = 0x600003f0,       // 0x60000000 | 1008
-  TAG_CERTIFICATE_NOT_AFTER = 0x600003f1,        // 0x60000000 | 1009
-  ALGORITHM_RSA = 1,
+  TAG_ORIGIN = 0x100002be,                       // KM_ENUM | 702
   ALGORITHM_EC = 3,
   KEY_FORMAT_PKCS8 = 1,
   KS_NO_ERROR = 1,
   KS_SYSTEM_ERROR = 4,
+  KS_UID_SELF = -1,
+  KM_SEC_SOFTWARE = 0,
+  KM_SEC_KEYSTORE = 100,  // KeyMint SecurityLevel::Keystore; Keystore1 reports these as software
 };
 
 namespace {
@@ -91,12 +96,17 @@ struct PendingKey {
   std::vector<uint8_t> pkcs8;   // private key, PKCS#8 DER
   std::vector<uint8_t> spki;    // public key, SubjectPublicKeyInfo DER
   std::vector<uint8_t> ta_blob; // key imported into the TA, for signing operations
+  std::vector<std::vector<uint8_t>> certs;  // attestation chain from the single mint
   std::vector<KmParam> params;  // key parameters from generateKey
   // Owns the bytes of every byte-array (BYTES/BIGNUM) parameter, in the order those parameters
   // appear in `params`. A KmParam only holds a raw `blob` pointer, so this storage must outlive the
   // key and the pointers must be rebound into it after any copy or move (RebindParamBlobs) — otherwise
   // they dangle into the caller's transient read buffer or into the source object.
   std::vector<std::vector<uint8_t>> param_blobs;
+  // TA-minted KeyCharacteristics. sw = SOFTWARE, hw = TEE/STRONGBOX. Empty until the first mint.
+  std::vector<KmParam> sw_chars;
+  std::vector<KmParam> hw_chars;
+  std::vector<std::vector<uint8_t>> char_blobs;
 
   // Point each byte-array parameter's `blob` at this object's own `param_blobs`. `params` and
   // `param_blobs` were built in lockstep, so the k-th byte-array parameter uses param_blobs[k].
@@ -130,7 +140,8 @@ TaPtr WrapTa(Ta* ta) {
 struct Profile {
   std::string id;
   TaPtr ta;
-  std::map<int, std::string> uids;  // uid -> package name
+  std::map<int, std::string> uids;           // uid -> package name
+  std::map<int, std::vector<uint8_t>> app_ids;  // uid -> official ApplicationId DER
 };
 
 // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mutex.
@@ -187,22 +198,29 @@ std::string PackageForUid(int uid) {
   return std::string();
 }
 
-// AttestationApplicationId ::= SEQUENCE { packages SET OF SEQUENCE { name
-// OCTET_STRING, version INTEGER }, signatures SET OF OCTET_STRING }. keystore
-// normally builds this from the caller's package; downstream of our hook it is
-// absent, so we synthesise it for the target package.
-std::vector<uint8_t> BuildAttestationApplicationId(const std::string& pkg) {
+std::vector<uint8_t> AppIdForUid(int uid) {
+  std::lock_guard<std::mutex> lk(g_cfg_mutex);
+  for (const auto& prof : g_profiles) {
+    auto it = prof.app_ids.find(uid);
+    if (it != prof.app_ids.end() && !it->second.empty()) return it->second;
+  }
+  return {};
+}
+
+// AOSP keystore_attestation_id.cpp: Package Manager failure uses this placeholder.
+std::vector<uint8_t> BuildUnknownPackageApplicationId() {
+  static const char kUnknown[] = "UnknownPackage";
   bssl::ScopedCBB cbb;
   CBB seq, pkg_set, pkg_seq, name, version, sig_set;
-  CBB_init(cbb.get(), 128);
+  CBB_init(cbb.get(), 64);
   CBB_add_asn1(cbb.get(), &seq, CBS_ASN1_SEQUENCE);
   CBB_add_asn1(&seq, &pkg_set, CBS_ASN1_SET);
   CBB_add_asn1(&pkg_set, &pkg_seq, CBS_ASN1_SEQUENCE);
   CBB_add_asn1(&pkg_seq, &name, CBS_ASN1_OCTETSTRING);
-  CBB_add_bytes(&name, reinterpret_cast<const uint8_t*>(pkg.data()), pkg.size());
+  CBB_add_bytes(&name, reinterpret_cast<const uint8_t*>(kUnknown), sizeof(kUnknown) - 1);
   CBB_add_asn1(&pkg_seq, &version, CBS_ASN1_INTEGER);
   CBB_add_u8(&version, 1);
-  CBB_add_asn1(&seq, &sig_set, CBS_ASN1_SET);  // no signature digests
+  CBB_add_asn1(&seq, &sig_set, CBS_ASN1_SET);
   uint8_t* out = nullptr;
   size_t len = 0;
   std::vector<uint8_t> v;
@@ -332,79 +350,6 @@ void WriteKeymasterArguments(Parcel& p, const std::vector<KmParam>& params) {
   }
 }
 
-// Marshal an EC key as PKCS#8 with the curve kept inside the inner ECPrivateKey.
-// BoringSSL's own PKCS#8 marshaling drops the curve from the inner key (it travels
-// in the outer AlgorithmIdentifier), but the reference TA stores that inner key
-// verbatim and, on its stock openssl backend, parses it for signing without the
-// algorithm context — so a curveless inner key cannot be loaded. Build the wrapper
-// by hand around a SEC1 body that retains its parameters.
-bool MarshalEcPkcs8(const EC_KEY* ec, std::vector<uint8_t>& out) {
-  static const uint8_t kEcPublicKeyOid[] = {0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01};
-  bssl::ScopedCBB cbb;
-  CBB info, algorithm, oid, private_key;
-  if (!CBB_init(cbb.get(), 128) ||
-      !CBB_add_asn1(cbb.get(), &info, CBS_ASN1_SEQUENCE) ||
-      !CBB_add_asn1_uint64(&info, 0) ||  // version
-      !CBB_add_asn1(&info, &algorithm, CBS_ASN1_SEQUENCE) ||
-      !CBB_add_asn1(&algorithm, &oid, CBS_ASN1_OBJECT) ||
-      !CBB_add_bytes(&oid, kEcPublicKeyOid, sizeof(kEcPublicKeyOid)) ||
-      !EC_KEY_marshal_curve_name(&algorithm, EC_KEY_get0_group(ec)) ||
-      !CBB_add_asn1(&info, &private_key, CBS_ASN1_OCTETSTRING) ||
-      !EC_KEY_marshal_private_key(&private_key, ec, 0))  // 0: keep curve and public key
-    return false;
-  uint8_t* der = nullptr;
-  size_t dlen = 0;
-  if (!CBB_finish(cbb.get(), &der, &dlen)) return false;
-  out.assign(der, der + dlen);
-  OPENSSL_free(der);
-  return true;
-}
-
-// Generate an EC or RSA key pair for the requested parameters, returning its
-// PKCS#8 private key and SubjectPublicKeyInfo public key.
-bool GenerateKeyPair(const std::vector<KmParam>& params, PendingKey& out) {
-  int64_t algorithm = ParamInt(params, TAG_ALGORITHM, ALGORITHM_EC);
-  bssl::UniquePtr<EVP_PKEY> pkey(EVP_PKEY_new());
-  if (algorithm == ALGORITHM_EC) {
-    int64_t curve = ParamInt(params, TAG_EC_CURVE, 1 /*P-256*/);
-    int nid = NID_X9_62_prime256v1;
-    if (curve == 0) nid = NID_secp224r1;
-    else if (curve == 2) nid = NID_secp384r1;
-    else if (curve == 3) nid = NID_secp521r1;
-    bssl::UniquePtr<EC_KEY> ec(EC_KEY_new_by_curve_name(nid));
-    if (!ec || !EC_KEY_generate_key(ec.get())) return false;
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec.release())) return false;
-  } else {
-    int64_t bits = ParamInt(params, TAG_KEY_SIZE, 2048);
-    bssl::UniquePtr<RSA> rsa(RSA_new());
-    bssl::UniquePtr<BIGNUM> e(BN_new());
-    BN_set_word(e.get(), RSA_F4);
-    if (!RSA_generate_key_ex(rsa.get(), static_cast<int>(bits), e.get(), nullptr)) return false;
-    if (!EVP_PKEY_assign_RSA(pkey.get(), rsa.release())) return false;
-  }
-
-  if (algorithm == ALGORITHM_EC) {
-    if (!MarshalEcPkcs8(EVP_PKEY_get0_EC_KEY(pkey.get()), out.pkcs8)) return false;
-  } else {
-    bssl::ScopedCBB cbb;
-    uint8_t* der = nullptr;
-    size_t dlen = 0;
-    CBB_init(cbb.get(), 0);
-    if (!EVP_marshal_private_key(cbb.get(), pkey.get()) ||  // PKCS#8 PrivateKeyInfo
-        !CBB_finish(cbb.get(), &der, &dlen))
-      return false;
-    out.pkcs8.assign(der, der + dlen);
-    OPENSSL_free(der);
-  }
-
-  uint8_t* der = nullptr;
-  int len = i2d_PUBKEY(pkey.get(), &der);  // SubjectPublicKeyInfo
-  if (len <= 0) return false;
-  out.spki.assign(der, der + len);
-  OPENSSL_free(der);
-  return true;
-}
-
 // Send a result back on the callback binder. onFinished is transaction code 1.
 void InvokeCallback(const sp<IBinder>& cb, const String16& cb_descriptor,
                     const std::function<void(Parcel&)>& write_body) {
@@ -421,9 +366,9 @@ void ReplyStatus(Parcel* reply, int32_t status) {
   reply->writeInt32(status);
 }
 
-// Add the tags the TA needs to build a certificate that Android 10 leaves for
-// keystore to fill in. app_id_store keeps a synthesised attestation application id
-// alive for the duration of the import call.
+// Tags Keystore1 would have bound, plus the ApplicationId the daemon gathered.
+// X.509 notBefore/notAfter are KeyMint-only tags; teesim-km fills them from
+// IKeymasterDevice.hal attestKey validity rules.
 void AddRequiredTags(std::vector<KmParam>& params, int uid,
                      std::vector<uint8_t>& app_id_store, bool with_attestation) {
   auto has = [&](uint32_t tag) {
@@ -434,23 +379,19 @@ void AddRequiredTags(std::vector<KmParam>& params, int uid,
   int64_t now_ms = static_cast<int64_t>(time(nullptr)) * 1000;
   if (!has(TAG_CREATION_DATETIME))
     params.push_back({TAG_CREATION_DATETIME, now_ms, nullptr, 0});
-  if (!has(TAG_CERTIFICATE_NOT_BEFORE))
-    params.push_back({TAG_CERTIFICATE_NOT_BEFORE, now_ms, nullptr, 0});
-  if (!has(TAG_CERTIFICATE_NOT_AFTER))
-    params.push_back({TAG_CERTIFICATE_NOT_AFTER, 4102444800000LL, nullptr, 0});  // ~year 2100
   if (ParamInt(params, TAG_ALGORITHM, ALGORITHM_EC) == ALGORITHM_EC && !has(TAG_EC_CURVE)) {
     int64_t sz = ParamInt(params, TAG_KEY_SIZE, 256);
     params.push_back({TAG_EC_CURVE, sz == 384 ? 2 : sz == 521 ? 3 : sz == 224 ? 0 : 1, nullptr, 0});
   }
   if (with_attestation && !has(TAG_ATTESTATION_APPLICATION_ID)) {
-    app_id_store = BuildAttestationApplicationId(PackageForUid(uid));
-    if (!app_id_store.empty())
-      params.push_back({TAG_ATTESTATION_APPLICATION_ID, 0, app_id_store.data(), app_id_store.size()});
+    app_id_store = AppIdForUid(uid);
+    if (app_id_store.empty()) app_id_store = BuildUnknownPackageApplicationId();
+    params.push_back({TAG_ATTESTATION_APPLICATION_ID, 0, app_id_store.data(), app_id_store.size()});
   }
 }
 
-// Import the key's PKCS#8 into the TA. `extra` carries any attestation tags the
-// caller supplies (the challenge). Returns a result the caller must free, or null.
+// Mint the key in the TA (teesim_km_generate_key). `extra` carries attestation
+// tags the caller supplies (the challenge). Returns a result the caller must free, or null.
 TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmParam>& extra,
                             bool with_attestation) {
   TaPtr ta = ProfileForUid(uid);
@@ -460,36 +401,140 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
   params.insert(params.end(), extra.begin(), extra.end());
   std::vector<uint8_t> app_id;
   AddRequiredTags(params, uid, app_id, with_attestation);
+  // TAG_ORIGIN is reported in KeyCharacteristics; the TA rejects it as an input (-40).
+  params.erase(std::remove_if(params.begin(), params.end(),
+                              [](const KmParam& p) { return p.tag == TAG_ORIGIN; }),
+               params.end());
   TsCreationResult* res = nullptr;
-  // The legacy Keystore HAL path has a single TA per profile at its configured security level; the
-  // attestation is emitted at that level.
-  int32_t rc = teesim_km_import_key(ta.get(), params.data(), params.size(),
-                                    KEY_FORMAT_PKCS8, k.pkcs8.data(), k.pkcs8.size(), nullptr, 0,
-                                    nullptr, 0, nullptr, 0, &res);
+  int32_t rc = teesim_km_generate_key(ta.get(), params.data(), params.size(), nullptr, 0, nullptr, 0,
+                                      nullptr, 0, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA import_key failed rc=%d", rc);
+    LOGE("keystore: TA generate_key failed rc=%d", rc);
     return nullptr;
   }
   return res;
 }
 
-// Make sure the key exists in the TA (generating the key pair first if needed) so
-// crypto operations can run against it. Call with g_keys_mutex held.
-bool EnsureTaKey(PendingKey& k, int uid) {
-  if (!k.ta_blob.empty()) return true;
-  if (k.pkcs8.empty() && !GenerateKeyPair(k.params, k)) return false;
-  // Import through the regular attestation path with a fixed challenge; only the
-  // resulting key blob matters here, and that path is well exercised.
-  static const uint8_t kChallenge[16] = {0};
-  std::vector<KmParam> extra = {{TAG_ATTESTATION_CHALLENGE, 0, kChallenge, sizeof(kChallenge)}};
-  TsCreationResult* res = ImportKey(k, uid, extra, true);
-  if (!res) return false;
+bool ExtractSpkiFromCert(const uint8_t* der, size_t len, std::vector<uint8_t>& out) {
+  const uint8_t* p = der;
+  bssl::UniquePtr<X509> cert(d2i_X509(nullptr, &p, static_cast<long>(len)));
+  if (!cert) return false;
+  uint8_t* spki = nullptr;
+  int n = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(cert.get()), &spki);
+  if (n <= 0 || !spki) return false;
+  out.assign(spki, spki + n);
+  OPENSSL_free(spki);
+  return true;
+}
+
+void StoreCharsFromResult(PendingKey& k, TsCreationResult* res) {
+  k.sw_chars.clear();
+  k.hw_chars.clear();
+  k.char_blobs.clear();
+  size_t n = teesim_km_result_num_chars(res);
+  for (size_t ci = 0; ci < n; ++ci) {
+    int32_t level = 0;
+    size_t np = teesim_km_result_char(res, ci, &level);
+    // A11 KeyCharacteristics only has software/tee. Keystore-enforced tags (creation
+    // datetime, etc.) are what the Java API shows in softwareEnforced.
+    auto& dest = (level == KM_SEC_SOFTWARE || level == KM_SEC_KEYSTORE) ? k.sw_chars : k.hw_chars;
+    for (size_t pi = 0; pi < np; ++pi) {
+      KmParam km{};
+      teesim_km_result_char_param(res, ci, pi, &km);
+      if (teesim_km_tag_value_kind(km.tag) == KM_VALUE_BYTES && km.blob && km.blob_len) {
+        k.char_blobs.emplace_back(km.blob, km.blob + km.blob_len);
+        km.blob = k.char_blobs.back().data();
+        km.blob_len = k.char_blobs.back().size();
+      }
+      dest.push_back(km);
+    }
+  }
+}
+
+void WriteKeyCharacteristics(Parcel& p, const std::vector<KmParam>& sw,
+                             const std::vector<KmParam>& hw) {
+  BeginTypedObject(p);
+  WriteKeymasterArguments(p, sw);
+  WriteKeymasterArguments(p, hw);
+}
+
+void StoreCreation(PendingKey& k, TsCreationResult* res) {
   const uint8_t* ptr = nullptr;
   size_t len = 0;
   teesim_km_result_key_blob(res, &ptr, &len);
   k.ta_blob.assign(ptr, ptr + len);
+  k.certs.clear();
+  size_t n = teesim_km_result_num_certs(res);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* c = nullptr;
+    size_t cl = 0;
+    teesim_km_result_cert(res, i, &c, &cl);
+    k.certs.emplace_back(c, c + cl);
+  }
+  if (!k.certs.empty()) ExtractSpkiFromCert(k.certs[0].data(), k.certs[0].size(), k.spki);
+  StoreCharsFromResult(k, res);
+}
+
+bool HasTag(const std::vector<KmParam>& params, uint32_t tag) {
+  for (const auto& p : params)
+    if (p.tag == tag) return true;
+  return false;
+}
+
+// One TA generate_key per alias. A second generate_key would change the public
+// key and break KeyPair vs leaf. Export may mint without attestation; attestKey
+// then re-issues the chain on the same blob.
+bool MintOnce(PendingKey& k, int uid, const std::vector<KmParam>& extra, bool with_attestation) {
+  if (!k.ta_blob.empty()) return true;
+  TsCreationResult* res = ImportKey(k, uid, extra, with_attestation);
+  if (!res) return false;
+  StoreCreation(k, res);
   teesim_km_free_result(res);
   return true;
+}
+
+bool StoreAttestChain(PendingKey& k, TsCreationResult* res) {
+  k.certs.clear();
+  size_t n = teesim_km_result_num_certs(res);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* c = nullptr;
+    size_t cl = 0;
+    teesim_km_result_cert(res, i, &c, &cl);
+    k.certs.emplace_back(c, c + cl);
+  }
+  if (!k.certs.empty()) ExtractSpkiFromCert(k.certs[0].data(), k.certs[0].size(), k.spki);
+  return !k.certs.empty();
+}
+
+// Keystore1 attestKey: same key, new attestation record (challenge / ApplicationId).
+bool AttestExisting(PendingKey& k, int uid, const std::vector<KmParam>& extra) {
+  TaPtr ta = ProfileForUid(uid);
+  if (!ta) ta = DefaultTa();
+  if (!ta || k.ta_blob.empty()) return false;
+  std::vector<KmParam> params = k.params;
+  params.insert(params.end(), extra.begin(), extra.end());
+  std::vector<uint8_t> app_id;
+  AddRequiredTags(params, uid, app_id, true);
+  params.erase(std::remove_if(params.begin(), params.end(),
+                              [](const KmParam& p) { return p.tag == TAG_ORIGIN; }),
+               params.end());
+  TsCreationResult* res = nullptr;
+  int32_t rc = teesim_km_attest_key(ta.get(), k.ta_blob.data(), k.ta_blob.size(), params.data(),
+                                    params.size(), nullptr, 0, nullptr, 0, nullptr, 0, &res);
+  if (rc != 0 || !res) {
+    LOGE("keystore: TA attest_key failed rc=%d", rc);
+    return false;
+  }
+  bool ok = StoreAttestChain(k, res);
+  teesim_km_free_result(res);
+  return ok;
+}
+
+// Make sure the key exists in the TA so export / begin can run. Do not invent a
+// challenge here — that would freeze a dummy value into the leaf.
+bool EnsureTaKey(PendingKey& k, int uid) {
+  if (!k.ta_blob.empty()) return true;
+  return MintOnce(k, uid, {}, HasTag(k.params, TAG_ATTESTATION_CHALLENGE));
 }
 
 // OperationResult { int resultCode, IBinder token, long operationHandle, int
@@ -519,18 +564,29 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
   key.params = std::move(params);
   key.param_blobs = std::move(blobs);  // take ownership so the params' blob pointers stay valid
   key.RebindParamBlobs();              // and repoint them into our own storage, not the read buffer
+  std::vector<KmParam> sw, hw;
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
-    g_keys[KeyId(uid, alias)] = std::move(key);
+    auto& stored = g_keys[KeyId(uid, alias)] = std::move(key);
+    if (!MintOnce(stored, uid, {}, HasTag(stored.params, TAG_ATTESTATION_CHALLENGE))) {
+      LOGE("keystore: generateKey mint failed alias=%s", String8(alias).c_str());
+      g_keys.erase(KeyId(uid, alias));
+      return false;
+    }
+    if (!stored.hw_chars.empty() || !stored.sw_chars.empty()) {
+      sw = stored.sw_chars;
+      hw = stored.hw_chars;
+    } else {
+      hw = stored.params;
+    }
   }
-  LOGI("keystore: generateKey simulated alias=%s", String8(alias).c_str());
+  LOGI("keystore: generateKey simulated alias=%s sw=%zu hw=%zu", String8(alias).c_str(), sw.size(),
+       hw.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreKeyCharacteristicsCallback");
-  InvokeCallback(cb, kCb, [](Parcel& p) {
+  InvokeCallback(cb, kCb, [&](Parcel& p) {
     WriteKeystoreResponse(p, KS_NO_ERROR);
-    BeginTypedObject(p);        // KeyCharacteristics
-    WriteEmptyArguments(p);     // swEnforced
-    WriteEmptyArguments(p);     // hwEnforced
+    WriteKeyCharacteristics(p, sw, hw);
   });
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
@@ -539,19 +595,22 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
 bool HandleGetKeyCharacteristics(int uid, Parcel& in, Parcel* reply) {
   sp<IBinder> cb = in.readStrongBinder();
   String16 alias = in.readString16();
-  std::vector<KmParam> params;
+  std::vector<KmParam> sw, hw;
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
     if (it == g_keys.end()) return false;  // not ours; forward
-    params = it->second.params;
+    if (!it->second.hw_chars.empty() || !it->second.sw_chars.empty()) {
+      sw = it->second.sw_chars;
+      hw = it->second.hw_chars;
+    } else {
+      hw = it->second.params;
+    }
   }
   static const String16 kCb("android.security.keystore.IKeystoreKeyCharacteristicsCallback");
   InvokeCallback(cb, kCb, [&](Parcel& p) {
     WriteKeystoreResponse(p, KS_NO_ERROR);
-    BeginTypedObject(p);                 // KeyCharacteristics
-    WriteEmptyArguments(p);              // swEnforced
-    WriteKeymasterArguments(p, params);  // hwEnforced
+    WriteKeyCharacteristics(p, sw, hw);
   });
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
@@ -590,42 +649,29 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
   std::vector<KmParam> attest_params;
   if (in.readInt32() == 1) attest_params = ReadKeymasterArguments(in, blobs);
 
-  PendingKey key;
+  std::vector<KmParam> extra;
+  for (const auto& p : attest_params) {
+    if (p.tag == TAG_ATTESTATION_CHALLENGE || p.tag == TAG_ATTESTATION_APPLICATION_ID)
+      extra.push_back(p);
+  }
+  LOGI("keystore: attest params challenge=%d appId=%d",
+       (int)std::count_if(attest_params.begin(), attest_params.end(),
+                          [](const KmParam& p) { return p.tag == TAG_ATTESTATION_CHALLENGE; }),
+       (int)std::count_if(attest_params.begin(), attest_params.end(),
+                          [](const KmParam& p) { return p.tag == TAG_ATTESTATION_APPLICATION_ID; }));
+
+  std::vector<std::vector<uint8_t>> chain;
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
     if (it == g_keys.end()) return false;  // not ours; forward
-    if (it->second.pkcs8.empty() && !GenerateKeyPair(it->second.params, it->second)) return false;
-    key = it->second;        // deep-copies param_blobs, but the params still point into the source...
-    key.RebindParamBlobs();  // ...so repoint them into this copy's own storage
+    if (it->second.ta_blob.empty()) {
+      if (!MintOnce(it->second, uid, extra, true)) return false;
+    } else if (!AttestExisting(it->second, uid, extra)) {
+      return false;
+    }
+    chain = it->second.certs;
   }
-
-  // The caller supplies the attestation challenge; the application id is synthesised.
-  std::vector<KmParam> extra;
-  for (const auto& p : attest_params)
-    if (p.tag == TAG_ATTESTATION_CHALLENGE) extra.push_back(p);
-  TsCreationResult* res = ImportKey(key, uid, extra, /*with_attestation=*/true);
-  if (!res) return false;
-
-  // Reuse the imported key blob for later signing operations.
-  {
-    const uint8_t* bp = nullptr;
-    size_t bl = 0;
-    teesim_km_result_key_blob(res, &bp, &bl);
-    std::lock_guard<std::mutex> lk(g_keys_mutex);
-    auto it = g_keys.find(KeyId(uid, alias));
-    if (it != g_keys.end() && it->second.ta_blob.empty()) it->second.ta_blob.assign(bp, bp + bl);
-  }
-
-  std::vector<std::vector<uint8_t>> chain;
-  size_t n = teesim_km_result_num_certs(res);
-  for (size_t i = 0; i < n; ++i) {
-    const uint8_t* ptr = nullptr;
-    size_t len = 0;
-    teesim_km_result_cert(res, i, &ptr, &len);
-    chain.emplace_back(ptr, ptr + len);
-  }
-  teesim_km_free_result(res);
   LOGI("keystore: attestKey simulated alias=%s certs=%zu", String8(alias).c_str(), chain.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreCertificateChainCallback");
@@ -777,6 +823,37 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
   return true;
 }
 
+// IKeystoreService.del / exist: int in the transaction reply, no callback binder.
+// The request uid is UID_SELF (-1) or the key's owner; both map onto g_keys.
+int ResolveKeyUid(int calling_uid, int32_t req_uid) {
+  return req_uid == KS_UID_SELF ? calling_uid : req_uid;
+}
+
+bool HandleDel(int calling_uid, Parcel& in, Parcel* reply) {
+  String16 alias = in.readString16();
+  int uid = ResolveKeyUid(calling_uid, in.readInt32());
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mutex);
+    auto it = g_keys.find(KeyId(uid, alias));
+    if (it == g_keys.end()) return false;  // not ours; forward
+    g_keys.erase(it);
+  }
+  LOGI("keystore: del simulated alias=%s uid=%d", String8(alias).c_str(), uid);
+  ReplyStatus(reply, KS_NO_ERROR);
+  return true;
+}
+
+bool HandleExist(int calling_uid, Parcel& in, Parcel* reply) {
+  String16 alias = in.readString16();
+  int uid = ResolveKeyUid(calling_uid, in.readInt32());
+  {
+    std::lock_guard<std::mutex> lk(g_keys_mutex);
+    if (g_keys.find(KeyId(uid, alias)) == g_keys.end()) return false;  // not ours; forward
+  }
+  ReplyStatus(reply, KS_NO_ERROR);
+  return true;
+}
+
 bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
   sp<IBinder> cb = in.readStrongBinder();
   sp<IBinder> token = in.readStrongBinder();
@@ -835,7 +912,11 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     if (p->uids[i] < 0) continue;
     const char* pkg = (p->uid_packages && p->uid_packages[i]) ? p->uid_packages[i] : "";
     prof.uids[p->uids[i]] = pkg;
-    LOGI("cfg:   uid %d -> package '%s'", p->uids[i], pkg);
+    if (p->uid_app_ids && p->uid_app_id_lens && p->uid_app_ids[i] && p->uid_app_id_lens[i] > 0) {
+      prof.app_ids[p->uids[i]].assign(p->uid_app_ids[i], p->uid_app_ids[i] + p->uid_app_id_lens[i]);
+    }
+    LOGI("cfg:   uid %d -> package '%s' appId=%zuB", p->uids[i], pkg,
+         prof.app_ids.count(p->uids[i]) ? prof.app_ids[p->uids[i]].size() : 0);
   }
   g_staging.push_back(std::move(prof));
   return true;
@@ -861,9 +942,9 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
   // The ordinals are release-specific, so this dispatch runs against the resolved table
   // rather than a compile-time switch (see TxCodes).
   const TxCodes& tx = Codes();
-  if (code != tx.generateKey && code != tx.getKeyCharacteristics && code != tx.exportKey &&
-      code != tx.attestKey && code != tx.begin && code != tx.update && code != tx.finish &&
-      code != tx.abort)
+  if (code != tx.del && code != tx.exist && code != tx.generateKey &&
+      code != tx.getKeyCharacteristics && code != tx.exportKey && code != tx.attestKey &&
+      code != tx.begin && code != tx.update && code != tx.finish && code != tx.abort)
     return false;
   int uid = IPCThreadState::self()->getCallingUid();
   if (!IsTarget(uid)) return false;
@@ -871,7 +952,9 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
   if (!r.p.enforceInterface(kServiceDescriptor)) return false;
 
   bool done = false;
-  if (code == tx.generateKey)                done = HandleGenerateKey(uid, r.p, reply);
+  if (code == tx.del)                        done = HandleDel(uid, r.p, reply);
+  else if (code == tx.exist)                 done = HandleExist(uid, r.p, reply);
+  else if (code == tx.generateKey)           done = HandleGenerateKey(uid, r.p, reply);
   else if (code == tx.getKeyCharacteristics) done = HandleGetKeyCharacteristics(uid, r.p, reply);
   else if (code == tx.exportKey)             done = HandleExportKey(uid, r.p, reply);
   else if (code == tx.attestKey)             done = HandleAttestKey(uid, r.p, reply);

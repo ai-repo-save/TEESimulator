@@ -25,12 +25,17 @@ calls funnel through that single library, so there is nothing to gain from scann
 ## Simulation
 
 For a target app the key never touches the real Keymaster. The handler
-([`keystore_router.cpp`](keystore_router.cpp)) generates the key pair itself and hands back its
-public key; at `attestKey` it imports that key into the reference TA with the app's challenge, so
-the TA issues a **keybox-signed** attestation over it. The same imported key backs the crypto
-lifecycle — `begin`/`update`/`finish`/`abort` run against the TA operation — so the key is usable
-for signing, not merely for attestation. Non-target callers are forwarded, so unrelated apps keep
-using the real hardware.
+(`keystore_router.cpp`) mints on `generateKey` in the reference TA (`teesim_km_generate_key`)
+so `Tag::ORIGIN` is `GENERATED` (`IKeymasterDevice.hal`) and the callback
+`KeyCharacteristics` are the TA hardware/software lists. Keystore1 `generateKey` does not
+attest; `attestKey` calls `teesim_km_attest_key` on that blob with the challenge and the
+`AttestationApplicationId` gathered from PackageManager
+(`keystore_attestation_id.cpp` / `KeyAttestationApplicationIdProviderService`).
+Leaf X.509 validity follows `IKeymasterDevice.hal` `attestKey`: `ACTIVE_DATETIME` or
+`CREATION_DATETIME` for `notBefore`, `USAGE_EXPIRE_DATETIME` or the batch certificate
+`notAfter`. `del` / `exist` hit the in-memory table so a later `exist` does not fall
+through to the real daemon. `begin`/`update`/`finish`/`abort` run against the TA
+operation. Non-target callers are forwarded.
 
 Because the legacy `IKeystoreService` methods deliver their results by transacting **back** on a
 callback binder passed in the request (the transaction's own reply is just a status), the handler
@@ -49,8 +54,8 @@ over the control socket; nothing here is read from disk.
   PLT hook, the `BR_TRANSACTION` watch, the target-to-stub rewrite, and the fall-through that
   replays a declined transaction to the real service.
 - [`keystore_router.cpp`](keystore_router.cpp) — `teesim_ks_handle`, the per-method simulation
-  (key generation, `attestKey`, the begin/update/finish/abort operation lifecycle) against the
-  reference TA, plus the callback-binder result delivery and per-app routing.
+  (`del`/`exist`, `generateKey` characteristics from the TA, `attestKey`, begin/update/finish/abort)
+  against the reference TA, plus the callback-binder result delivery and per-app routing.
 - [`aosp/`](aosp) — the minimal vendored AOSP `libbinder`/`libbase`/`libutils` headers and stubs
   the interceptor compiles against; the device's real libraries resolve at runtime.
 

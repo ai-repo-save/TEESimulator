@@ -68,6 +68,10 @@ typedef struct {
   // keystore1 rebuilds an attestation application id from it, since downstream of that hook the
   // caller's own is already gone. NULL means "no names known".
   const char *const *uid_packages;
+  // Parallel to uids[]: official AttestationApplicationId DER from the daemon's PackageManager.
+  // NULL / zero length means keystore1 falls back to synthesising from uid_packages[].
+  const uint8_t *const *uid_app_ids;
+  const size_t *uid_app_id_lens;
 } TsProfile;
 
 // --- staging API, implemented by each router ---------------------------------

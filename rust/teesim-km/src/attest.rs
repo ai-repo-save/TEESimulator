@@ -14,6 +14,8 @@ use kmr_common::{
 use kmr_ta::device::{RetrieveCertSigningInfo, SigningAlgorithm, SigningKeyType};
 use kmr_wire::keymint::{self, EcCurve};
 use roxmltree::Document;
+use x509_cert::der::Decode;
+use x509_cert::Certificate;
 
 /// Per-algorithm signing key material plus its certificate chain.
 #[derive(Clone)]
@@ -54,6 +56,16 @@ impl CertSignInfo {
     pub fn batch(&self, prefer_ec: bool) -> (KeyMaterial, &[keymint::Certificate], bool) {
         let (a, is_ec) = self.pick(prefer_ec);
         (a.key.clone(), &a.chain, is_ec)
+    }
+
+    /// `notAfter` of the batch attestation certificate that will sign the leaf, in ms since epoch.
+    /// `IKeymasterDevice.hal` attestKey uses this when `Tag::USAGE_EXPIRE_DATETIME` is absent.
+    pub fn batch_not_after_ms(&self, prefer_ec: bool) -> Option<i64> {
+        let (_, chain, _) = self.batch(prefer_ec);
+        let der = &chain.first()?.encoded_certificate;
+        let cert = Certificate::from_der(der).ok()?;
+        let ms = cert.tbs_certificate.validity.not_after.to_unix_duration().as_millis();
+        i64::try_from(ms).ok()
     }
 }
 

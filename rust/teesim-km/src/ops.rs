@@ -78,10 +78,40 @@ impl Ta {
             attestation_key.is_some()
         );
         ensure_creation_datetime(&mut key_params);
+        self.ensure_keymaster_leaf_validity(&mut key_params);
         let resp: Result<GenerateKeyResponse, OpError> =
             self.perform(GenerateKeyRequest { key_params, attestation_key });
         let ret = resp?.ret;
         crate::resign::log_chain("teesim_km: generate_key result", &ret.certificate_chain);
+        Ok(marked_result(ret))
+    }
+
+    /// attestKey on an existing TA blob: same public key, new attestation record.
+    pub fn attest_key(
+        &mut self,
+        key_blob: &[u8],
+        mut key_params: Vec<KeyParam>,
+        attestation_key: Option<AttestationKey>,
+    ) -> Result<KeyCreationResult, OpError> {
+        log::info!(
+            "teesim_km: attest_key: {} param(s), blob_len={}",
+            key_params.len(),
+            key_blob.len()
+        );
+        ensure_creation_datetime(&mut key_params);
+        self.ensure_keymaster_leaf_validity(&mut key_params);
+        let ret = self
+            .inner
+            .attest_existing_key(strip_marker(key_blob), &key_params, attestation_key)
+            .map_err(|e| {
+                let code = match e.kind() {
+                    kmr_common::ErrorKind::Hal(c, _) => *c as i32,
+                    _ => ERR_UNKNOWN,
+                };
+                log::error!("teesim_km: attest_key failed: {e:?}");
+                OpError { code, msg: format!("{e:?}") }
+            })?;
+        crate::resign::log_chain("teesim_km: attest_key result", &ret.certificate_chain);
         Ok(marked_result(ret))
     }
 
@@ -103,6 +133,7 @@ impl Ta {
             attestation_key.is_some()
         );
         ensure_creation_datetime(&mut key_params);
+        self.ensure_keymaster_leaf_validity(&mut key_params);
         let resp: Result<ImportKeyResponse, OpError> =
             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
         let ret = resp?.ret;
@@ -252,6 +283,46 @@ impl Ta {
             app_data,
         })?;
         Ok(resp.ret)
+    }
+}
+
+impl Ta {
+    /// KeyMint `generateKey` requires `CERTIFICATE_NOT_*`. Keystore1 never sends those tags.
+    /// `IKeymasterDevice.hal` attestKey sets X.509 validity from `ACTIVE_DATETIME` or
+    /// `CREATION_DATETIME`, and `USAGE_EXPIRE_DATETIME` or the batch attestation certificate
+    /// expiry. Applied only when the TA reports a pre-KeyMint attestation version.
+    fn ensure_keymaster_leaf_validity(&self, params: &mut Vec<KeyParam>) {
+        if self.inner.attestation_version() >= 100 {
+            return;
+        }
+        let has_not_before = params.iter().any(|p| matches!(p, KeyParam::CertificateNotBefore(_)));
+        let has_not_after = params.iter().any(|p| matches!(p, KeyParam::CertificateNotAfter(_)));
+        if has_not_before && has_not_after {
+            return;
+        }
+        let active = params.iter().find_map(|p| match p {
+            KeyParam::ActiveDatetime(d) => Some(d.ms_since_epoch),
+            _ => None,
+        });
+        let creation = params.iter().find_map(|p| match p {
+            KeyParam::CreationDatetime(d) => Some(d.ms_since_epoch),
+            _ => None,
+        });
+        let usage_expire = params.iter().find_map(|p| match p {
+            KeyParam::UsageExpireDatetime(d) => Some(d.ms_since_epoch),
+            _ => None,
+        });
+        let prefer_ec = params.iter().any(|p| matches!(p, KeyParam::Algorithm(kmr_wire::keymint::Algorithm::Ec)));
+        let batch_expire = self.sign_info.batch_not_after_ms(prefer_ec).unwrap_or(0);
+        if !has_not_before {
+            let ms = active.or(creation).unwrap_or(0);
+            params.push(KeyParam::CertificateNotBefore(DateTime { ms_since_epoch: ms }));
+        }
+        if !has_not_after {
+            params.push(KeyParam::CertificateNotAfter(DateTime {
+                ms_since_epoch: usage_expire.unwrap_or(batch_expire),
+            }));
+        }
     }
 }
 

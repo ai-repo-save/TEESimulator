@@ -369,6 +369,41 @@ pub unsafe extern "C" fn teesim_km_generate_key(
 }
 
 /// # Safety
+/// See module docs; `key_blob`/`key_blob_len` must describe a blob from generate_key.
+#[no_mangle]
+pub unsafe extern "C" fn teesim_km_attest_key(
+    ta: *mut Ta,
+    key_blob: *const u8,
+    key_blob_len: usize,
+    params: *const KmParam,
+    n_params: usize,
+    ak_blob: *const u8,
+    ak_blob_len: usize,
+    ak_params: *const KmParam,
+    ak_n_params: usize,
+    ak_issuer: *const u8,
+    ak_issuer_len: usize,
+    out: *mut *mut TsCreationResult,
+) -> i32 {
+    match call(|| {
+        let _lk = crate::lock_ta();
+        let ta = &mut *ta;
+        let blob = if key_blob.is_null() { &[][..] } else { slice::from_raw_parts(key_blob, key_blob_len) };
+        let key_params = to_keyparams(params, n_params)?;
+        let attestation_key =
+            build_attestation_key(ak_blob, ak_blob_len, ak_params, ak_n_params, ak_issuer, ak_issuer_len)?;
+        let result = ta.attest_key(blob, key_params, attestation_key)?;
+        Ok(TsCreationResult::new(result))
+    }) {
+        Ok(r) => {
+            *out = Box::into_raw(Box::new(r));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// # Safety
 /// See module docs.
 #[no_mangle]
 pub unsafe extern "C" fn teesim_km_import_key(

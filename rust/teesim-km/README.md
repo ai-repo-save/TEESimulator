@@ -118,8 +118,12 @@ attestation 3 / keymaster 4, 4.1 is 4 / 41; KeyMint versions are equal). The lev
 from the harvest, or are fabricated (TrustedEnvironment and the OS-appropriate version) when the
 device produced no working hardware attestation; a broken StrongBox reuses the TEE version. The
 `set_attestation_version` setter this construction needs is added to `kmr-ta` by
-[`patches/kmr-ta-seclevel.patch`](../patches/kmr-ta-seclevel.patch), applied the same idempotent way
-as the BoringSSL patch below.
+`rust/patches/kmr-ta-seclevel.patch`. The same patch copies `CreationDatetime` from the request
+into the leaf `softwareEnforced` list when the bound blob dropped `SecurityLevel::Keystore`
+characteristics (`IKeymasterDevice.hal`: `Tag::CREATION_DATETIME` is software-enforced).
+On a pre-KeyMint TA, `teesim-km` also fills KeyMint `CERTIFICATE_NOT_*` from the Keymaster
+`attestKey` validity rule (active/creation datetime, usage expiry or batch certificate
+`notAfter`). The patch is applied the same idempotent way as the BoringSSL patch below.
 
 Every C-ABI entry that touches a TA handle takes the process-wide `lock_ta()` guard for the duration
 of the call: `kmr-ta` keeps mutable state and is not internally synchronized, but keystore2 drives us

@@ -1,5 +1,5 @@
 diff --git a/ta/src/cert.rs b/ta/src/cert.rs
-index ce07450..39b4d20 100644
+index ce07450..9b0cee4 100644
 --- a/ta/src/cert.rs
 +++ b/ta/src/cert.rs
 @@ -300,9 +300,21 @@ enum SecurityLevel {
@@ -25,10 +25,21 @@ index ce07450..39b4d20 100644
      challenge: &'a [u8],
      app_id: &'a [u8],
      security_level: keymint::SecurityLevel,
-@@ -333,6 +345,14 @@ pub(crate) fn attestation_extension<'a>(
+@@ -333,8 +345,27 @@ pub(crate) fn attestation_extension<'a>(
          keymint::SecurityLevel::Software => (params, &[]),
          _ => (&[], params),
      };
++    // Keystore1 attestKey re-uses a blob that dropped SecurityLevel::Keystore characteristics.
++    // CreationDatetime is Keystore-enforced; on a TEE TA the request `params` are classified as
++    // hw (above). IKeymasterDevice.hal requires Tag::CREATION_DATETIME in softwareEnforced.
++    let mut sw_owned: Vec<KeyParam> = sw_chars.to_vec();
++    for p in params.iter() {
++        if matches!(p, KeyParam::CreationDatetime(_))
++            && !sw_owned.iter().any(|q| matches!(q, KeyParam::CreationDatetime(_)))
++        {
++            sw_owned.push(p.clone());
++        }
++    }
 +    // Tag::MODULE_HASH (724) was introduced in KeyMint v4 (attestationVersion 400); no earlier
 +    // KeyMint or Keymaster attestation carries it. Gate the additional info by the version this key
 +    // is emitted at so the tag tracks that version even when the TA has a module hash recorded. The
@@ -38,9 +49,12 @@ index ce07450..39b4d20 100644
 +    let additional_attestation_info: &[KeyParam] =
 +        if attestation_version >= 400 { additional_attestation_info } else { &[] };
      let sw_enforced = AuthorizationList::new(
-         sw_chars,
+-        sw_chars,
++        sw_owned,
          sw_params,
-@@ -352,9 +372,9 @@ pub(crate) fn attestation_extension<'a>(
+         attestation_ids,
+         None,
+@@ -352,9 +383,9 @@ pub(crate) fn attestation_extension<'a>(
      let sec_level = SecurityLevel::try_from(security_level as u32)
          .map_err(|_| km_err!(InvalidArgument, "invalid security level {security_level:?}"))?;
      let ext = AttestationExtension {
@@ -52,8 +66,17 @@ index ce07450..39b4d20 100644
          keymint_security_level: sec_level,
          attestation_challenge: challenge,
          unique_id,
+@@ -580,7 +611,7 @@ impl<'a> AuthorizationList<'a> {
+     /// ID attestation is required but the relevant IDs are missing or mismatched.  Any
+     /// `UserSecureId` values included in `auths` will be ignored on encoding.
+     fn new(
+-        auths: &'a [KeyParam],
++        auths: impl Into<Cow<'a, [KeyParam]>>,
+         keygen_params: &'a [KeyParam],
+         attestation_ids: Option<&crate::AttestationIdInfo>,
+         rot_info: Option<RootOfTrust>,
 diff --git a/ta/src/keys.rs b/ta/src/keys.rs
-index 60f9895..f4d3310 100644
+index 60f9895..5379103 100644
 --- a/ta/src/keys.rs
 +++ b/ta/src/keys.rs
 @@ -174,7 +174,7 @@ impl crate::KeyMintTa {
@@ -65,6 +88,31 @@ index 60f9895..f4d3310 100644
                      challenge,
                      app_id,
                      self.hw_info.security_level,
+@@ -284,6 +284,24 @@ impl crate::KeyMintTa {
+         )
+     }
+ 
++    /// Re-issue the attestation chain for an already-generated key (Keystore1 `attestKey`).
++    /// The public key is unchanged; the returned blob is a re-wrap and may be discarded.
++    pub fn attest_existing_key(
++        &mut self,
++        key_blob: &[u8],
++        params: &[KeyParam],
++        attestation_key: Option<AttestationKey>,
++    ) -> Result<KeyCreationResult, Error> {
++        let (plain, _) = self.keyblob_parse_decrypt(key_blob, &[])?;
++        self.finish_keyblob_creation(
++            params,
++            attestation_key,
++            plain.characteristics,
++            plain.key_material,
++            keyblob::SlotPurpose::KeyGeneration,
++        )
++    }
++
+     pub(crate) fn generate_key_material(
+         &mut self,
+         params: &[KeyParam],
 diff --git a/ta/src/lib.rs b/ta/src/lib.rs
 index f281543..5f17d72 100644
 --- a/ta/src/lib.rs

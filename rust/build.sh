@@ -39,7 +39,10 @@ export ANDROID_NDK_HOME="$NDK_HOME" ANDROID_NDK_ROOT="$NDK_HOME" ANDROID_NDK="$N
 # (kmr-ta-seclevel.patch) and auth tokens it holds no device HMAC key to verify
 # (kmr-ta-authtoken.patch). Each patch is applied to the submodule working tree,
 # idempotently — skipped when it already reverse-applies, i.e. is already present.
-for PATCH in "$HERE"/patches/*.patch; do
+# Locale-independent order so `kmr-ta-seclevel.patch` precedes
+# `kmr-ta-seclevel2-creation-datetime.patch` (zh_CN collation can invert them).
+mapfile -t PATCHES < <(printf '%s\n' "$HERE"/patches/*.patch | LC_ALL=C sort)
+for PATCH in "${PATCHES[@]}"; do
   if git -C "$ROOT/third_party/keymint" apply -p1 --reverse --check "$PATCH" 2>/dev/null; then
     :
   else

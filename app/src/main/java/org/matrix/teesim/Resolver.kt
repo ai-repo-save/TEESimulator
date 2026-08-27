@@ -170,12 +170,16 @@ object Resolver {
         o.put("packageUsers", packageUsers)
         val uids = JSONArray()
         val uidPackages = JSONArray()
+        val uidAppIds = JSONArray()
         for (u in scope.uids) {
             uids.put(u)
             uidPackages.put(scope.uidPackages[u] ?: "")
+            val der = AttestationApplicationId.forUid(u)
+            uidAppIds.put(if (der != null) b64.encodeToString(der) else "")
         }
         o.put("uids", uids)
         o.put("uidPackages", uidPackages)
+        o.put("uidAppIds", uidAppIds)
         return o
     }
 
