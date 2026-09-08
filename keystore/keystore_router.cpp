@@ -321,9 +321,6 @@ void WriteKeystoreResponse(Parcel& p, int32_t code) {
   p.writeString16(nullptr, 0);  // null errorMessage
 }
 
-// KeymasterArguments: int32 count then the entries (we emit none).
-void WriteEmptyArguments(Parcel& p) { p.writeInt32(0); }
-
 // KeymasterArguments carrying the given parameters (reverse of the reader).
 void WriteKeymasterArguments(Parcel& p, const std::vector<KmParam>& params) {
   p.writeInt32(static_cast<int32_t>(params.size()));
@@ -540,15 +537,18 @@ bool EnsureTaKey(PendingKey& k, int uid) {
 // OperationResult { int resultCode, IBinder token, long operationHandle, int
 // inputConsumed, byte[] output, KeymasterArguments outParams }, as the non-null
 // callback argument. Note the output array precedes outParams in this version.
+// AES/GCM encrypt begin returns KM_TAG_NONCE in outParams; AndroidKeyStore
+// Cipher.getIV() is that nonce. Empty outParams leaves getIV() null.
 void WriteOperationResult(Parcel& p, int32_t code, const sp<IBinder>& token, int64_t op_handle,
-                          int32_t input_consumed, const std::vector<uint8_t>& output) {
+                          int32_t input_consumed, const std::vector<uint8_t>& output,
+                          const std::vector<KmParam>& out_params) {
   BeginTypedObject(p);
   p.writeInt32(code);
   p.writeStrongBinder(token);
   p.writeInt64(op_handle);
   p.writeInt32(input_consumed);
   p.writeByteArray(output.size(), output.data());
-  WriteEmptyArguments(p);  // outParams
+  WriteKeymasterArguments(p, out_params);
 }
 
 // --- Per-method handlers ----------------------------------------------------
@@ -723,6 +723,24 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     LOGE("keystore: TA begin failed rc=%d", rc);
     return false;
   }
+  std::vector<std::vector<uint8_t>> out_blobs;
+  std::vector<KmParam> out_params;
+  const size_t nparams = teesim_km_begin_num_params(res);
+  out_params.reserve(nparams);
+  out_blobs.reserve(nparams);
+  for (size_t i = 0; i < nparams; ++i) {
+    KmParam kp{};
+    teesim_km_begin_param(res, i, &kp);
+    if (kp.blob != nullptr && kp.blob_len > 0) {
+      out_blobs.emplace_back(kp.blob, kp.blob + kp.blob_len);
+      kp.blob = out_blobs.back().data();
+      kp.blob_len = out_blobs.back().size();
+    } else {
+      kp.blob = nullptr;
+      kp.blob_len = 0;
+    }
+    out_params.push_back(kp);
+  }
   int64_t op_handle = teesim_km_begin_op_handle(res);
   teesim_km_free_begin(res);
 
@@ -731,11 +749,13 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     std::lock_guard<std::mutex> lk(g_ops_mutex);
     g_ops[token.get()] = {token, op_handle, ta};
   }
-  LOGI("keystore: begin purpose=%d alias=%s", purpose, String8(alias).c_str());
+  LOGI("keystore: begin purpose=%d alias=%s out_params=%zu", purpose, String8(alias).c_str(),
+       out_params.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreOperationResultCallback");
-  InvokeCallback(cb, kCb,
-                 [&](Parcel& p) { WriteOperationResult(p, KS_NO_ERROR, token, op_handle, 0, {}); });
+  InvokeCallback(cb, kCb, [&](Parcel& p) {
+    WriteOperationResult(p, KS_NO_ERROR, token, op_handle, 0, {}, out_params);
+  });
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
 }
@@ -756,7 +776,7 @@ void DeliverOperationResult(const sp<IBinder>& cb, int32_t rc, const sp<IBinder>
   static const String16 kCb("android.security.keystore.IKeystoreOperationResultCallback");
   InvokeCallback(cb, kCb, [&](Parcel& p) {
     WriteOperationResult(p, rc == 0 ? KS_NO_ERROR : KS_SYSTEM_ERROR, token, 0, input_consumed,
-                         output);
+                         output, {});
   });
 }
 
