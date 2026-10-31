@@ -28,7 +28,7 @@ target_include_directories(lsplt PUBLIC ${LSPLT_JNI}/include)
 target_include_directories(lsplt PRIVATE ${LSPLT_JNI})
 
 # --- The injector -----------------------------------------------------------
-add_executable(inject injector/main.cpp injector/utils.cpp)
+add_executable(inject injector/main.cpp injector/utils.cpp common/log_context.cpp)
 target_include_directories(inject PRIVATE injector/include)
 target_link_libraries(inject PRIVATE lsplt log)
 target_link_options(inject PRIVATE -static-libstdc++)
@@ -197,13 +197,23 @@ endif()
 add_library(teesim_keymint SHARED
     keymint/keymint_router.cpp keymint/keymint_hook.cpp keymint/keymint_entry.cpp
     keymint/crypto_compat.c
-    common/control.cpp common/json.cpp)
+    common/control.cpp common/json.cpp common/log_context.cpp common/km_names.cpp
+    common/redact.cpp)
 add_dependencies(teesim_keymint rust_ta)
 target_include_directories(teesim_keymint PRIVATE
     keymint common injector/include rust/teesim-km/include ${LSPLT_JNI}/include)
 # libbinder_ndk and liblog come from the NDK sysroot; libcrypto is either the
 # runtime stub (shadowed by the host's copy) or a bundled static BoringSSL.
-target_link_libraries(teesim_keymint PRIVATE keymint_aidl lsplt ${RUST_A} ${CRYPTO_LINK} binder_ndk log)
+# --whole-archive on the Rust archive forces compiler_builtins' emutls.o in: the NDK's
+# static libc++abi (cxa_thread_atexit.cpp.o) calls __emutls_get_address at runtime, and
+# emutls.o carries the only definition.  Without --whole-archive the weak definition is
+# not reliably extracted, leaving an undefined dynamic import that bionic cannot resolve
+# when the .so is dlopen'd into a C++ process that has no emutls runtime of its own
+# (legacy /system/bin/keystore on Android 10/11).  --gc-sections still drops the dead
+# code, so only the reachable emutls functions survive in the output.
+target_link_libraries(teesim_keymint PRIVATE keymint_aidl lsplt
+    -Wl,--whole-archive ${RUST_A} -Wl,--no-whole-archive
+    ${CRYPTO_LINK} binder_ndk log)
 target_link_options(teesim_keymint PRIVATE
     -static-libstdc++
     # Binder/log calls newer than the min-SDK are absent from the NDK stub; let them
@@ -238,7 +248,8 @@ target_link_libraries(binder_stub PRIVATE utils_stub)
 
 add_library(teesim_keystore SHARED
     keystore/binder_interceptor.cpp keystore/keystore_router.cpp keystore/keystore_entry.cpp
-    common/control.cpp common/json.cpp)
+    common/control.cpp common/json.cpp common/log_context.cpp common/km_names.cpp
+    common/redact.cpp)
 add_dependencies(teesim_keystore rust_ta)
 target_include_directories(teesim_keystore PRIVATE
     keystore common ${AOSP}/include injector/include ${LSPLT_JNI}/include
@@ -246,7 +257,9 @@ target_include_directories(teesim_keystore PRIVATE
 target_compile_definitions(teesim_keystore PRIVATE BINDER_DISABLE_NATIVE_HANDLE)
 target_compile_options(teesim_keystore PRIVATE ${BINDER_CXX_FLAGS})
 target_link_libraries(teesim_keystore PRIVATE
-    binder_stub utils_stub lsplt log ${RUST_A} ${KEYSTORE_CRYPTO})
+    binder_stub utils_stub lsplt log
+    -Wl,--whole-archive ${RUST_A} -Wl,--no-whole-archive  # see the comment on teesim_keymint
+    ${KEYSTORE_CRYPTO})
 target_link_options(teesim_keystore PRIVATE
     -static-libstdc++
     -Wl,-z,undefs

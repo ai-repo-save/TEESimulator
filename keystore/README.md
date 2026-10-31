@@ -36,7 +36,9 @@ Leaf X.509 validity follows `IKeymasterDevice.hal` `attestKey`: `ACTIVE_DATETIME
 `notAfter`. `del` / `exist` hit the in-memory table so a later `exist` does not fall
 through to the real daemon. `begin`/`update`/`finish`/`abort` run against the TA
 operation. `begin` returns the TA `outParams` (AES/GCM `KM_TAG_NONCE` for
-`Cipher.getIV()`). Non-target callers are forwarded.
+`Cipher.getIV()`). A symmetric key (`AES`/`3DES`/`HMAC`) is never attested, and this path
+cannot produce one, so `generateKey` declines it and the real daemon creates it. Non-target
+callers are forwarded.
 
 Because the legacy `IKeystoreService` methods deliver their results by transacting **back** on a
 callback binder passed in the request (the transaction's own reply is just a status), the handler

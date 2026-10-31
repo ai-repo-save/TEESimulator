@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "inj"
 #include "logging.hpp" // Custom logging utilities
 #include "lsplt.hpp"   // Library for scanning memory maps
 #include "utils.hpp"   // Utility functions for ptrace, remote memory, etc.
@@ -89,6 +91,18 @@ using namespace std::string_literals;
 
 namespace inject {
 
+// Milliseconds on CLOCK_MONOTONIC, so an injection can say how long it took and a stall in the
+// ptrace dance stands apart from a fast success.
+struct Elapsed {
+    static unsigned long long NowMs() {
+        struct timespec ts {};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<unsigned long long>(ts.tv_sec) * 1000ull + ts.tv_nsec / 1000000ull;
+    }
+    unsigned long long t0 = NowMs();
+    unsigned long long Ms() const { return NowMs() - t0; }
+};
+
 // Namespace for constants used throughout the injection process.
 namespace constants {
 constexpr size_t kMagicLength = 16;
@@ -135,12 +149,12 @@ public:
         }
         // Only attempt to close if a valid FD exists.
 
-        LOGD("Cleaning up remote file descriptor %d in process %d.", fd_, pid_);
+        LOGD("~RemoteLibraryHandle: closing remote fd=%d in pid=%d", fd_, pid_);
 
         struct user_regs_struct regs{};
         // We need current registers to perform a remote call.
         if (!get_regs(pid_, regs)) {
-            LOGW("Failed to get remote registers for FD cleanup in destructor.");
+            LOGW("~RemoteLibraryHandle: get registers failed; remote fd left open");
             return;
         }
 
@@ -153,7 +167,7 @@ public:
             // Perform a remote call to close the file descriptor.
             remote_call(pid_, regs, reinterpret_cast<uintptr_t>(close_addr), libc_return_addr_, args);
         } else {
-            LOGW("Failed to find remote 'close' function to cleanup transferred FD.");
+            LOGW("~RemoteLibraryHandle: no remote close(); remote fd left open");
         }
     }
 
@@ -229,19 +243,18 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
                                                 const std::vector<lsplt::MapInfo> &local_map,
                                                 const std::vector<lsplt::MapInfo> &remote_map,
                                                 uintptr_t libc_return_addr) {
-    LOGD("Attempting to transfer file descriptor for library: %s", lib_path);
 
     // Create a local Unix domain socket for FD transfer.
     UniqueFd local_socket = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (local_socket == -1) {
-        PLOGE("Failed to create local Unix domain socket.");
+        PLOGE("transfer_fd_to_remote: local unix socket");
         return std::nullopt;
     }
 
     // Open the local library file to get a file descriptor.
     UniqueFd local_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
     if (local_lib_fd == -1) {
-        PLOGE("Failed to open library file: %s", lib_path);
+        PLOGE("transfer_fd_to_remote: open %s", lib_path);
         return std::nullopt;
     }
 
@@ -262,7 +275,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     funcs.errno_addr = find_func_addr(local_map, remote_map, constants::kLibcModule, "__errno");
 
     if (!funcs.socket_addr || !funcs.bind_addr || !funcs.recvmsg_addr || !funcs.close_addr || !funcs.errno_addr) {
-        LOGE("Failed to resolve all required libc functions in remote process.");
+        LOGE("transfer_fd_to_remote: could not resolve the remote libc functions");
         return std::nullopt;
     }
 
@@ -272,7 +285,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         auto addr = remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.errno_addr), libc_return_addr, args);
         int err = 0;
         if (!addr || !read_proc(pid, addr, &err, sizeof(err))) {
-            LOGW("Failed to read remote errno value.");
+            LOGW("transfer_fd_to_remote: could not read the remote errno");
             return 0;
         }
         return err;
@@ -283,9 +296,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         std::vector<uintptr_t> args = {static_cast<uintptr_t>(fd)};
         if (remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.close_addr), libc_return_addr, args) ==
             static_cast<uintptr_t>(-1)) {
-            LOGE("Failed to close remote fd %d. Remote errno: %d", fd, get_remote_errno());
-        } else {
-            LOGV("Successfully closed remote fd %d.", fd);
+            LOGE("transfer_fd_to_remote: remote close(fd=%d) failed, errno=%d", fd, get_remote_errno());
         }
     };
 
@@ -298,10 +309,9 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         // socket() returning 0 is technically possible (if stdin closed),
         // but highly unlikely for a daemon. We treat 0 as failure here to catch the injection error.
         errno = get_remote_errno(); // Set local errno for PLOGE.
-        PLOGE("Failed to create remote socket (returned %d).", remote_fd);
+        PLOGE("transfer_fd_to_remote: remote socket() returned %d", remote_fd);
         return std::nullopt;
     }
-    LOGD("Successfully created remote socket with FD: %d", remote_fd);
 
     // Generate a unique magic string for the abstract Unix domain socket path.
     auto magic = generateMagic(constants::kMagicLength);
@@ -313,7 +323,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // Push the sockaddr_un structure to the remote process's stack.
     auto remote_addr = push_memory(pid, regs, &sock_addr, sizeof(sock_addr));
     if (remote_addr == 0) {
-        LOGE("Failed to push socket address to remote memory.");
+        LOGE("transfer_fd_to_remote: push socket address failed");
         close_remote(remote_fd);
         return std::nullopt;
     }
@@ -323,11 +333,11 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     auto bind_result = remote_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.bind_addr), libc_return_addr, args);
     if (bind_result == static_cast<uintptr_t>(-1)) {
         errno = get_remote_errno();
-        PLOGE("Failed to bind remote socket to path: %s", magic.c_str());
+        PLOGE("transfer_fd_to_remote: remote bind to %s", magic.c_str());
         close_remote(remote_fd);
         return std::nullopt;
     }
-    LOGD("Remote socket bound to path: %s", magic.c_str());
+    LOGD("transfer_fd_to_remote: remote socket bound to %s", magic.c_str());
 
     // Prepare control message buffer for SCM_RIGHTS (file descriptor passing).
     char cmsgbuf[CMSG_SPACE(sizeof(int))] = {0};
@@ -335,7 +345,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // Push the control message buffer to the remote process's stack.
     auto remote_cmsgbuf = push_memory(pid, regs, &cmsgbuf, sizeof(cmsgbuf));
     if (remote_cmsgbuf == 0) {
-        LOGE("Failed to push control message buffer to remote memory.");
+        LOGE("transfer_fd_to_remote: push control message buffer failed");
         close_remote(remote_fd);
         return std::nullopt;
     }
@@ -348,7 +358,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // Push the msghdr structure to the remote process's stack.
     auto remote_hdr = push_memory(pid, regs, &msg_hdr, sizeof(msg_hdr));
     if (remote_hdr == 0) {
-        LOGE("Failed to push message header to remote memory.");
+        LOGE("transfer_fd_to_remote: push message header failed");
         close_remote(remote_fd);
         return std::nullopt;
     }
@@ -356,11 +366,10 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     // Initiate the remote recvmsg call. This will block the remote process.
     args = {static_cast<uintptr_t>(remote_fd), remote_hdr, MSG_WAITALL};
     if (!remote_pre_call(pid, regs, reinterpret_cast<uintptr_t>(funcs.recvmsg_addr), libc_return_addr, args)) {
-        LOGE("Failed to initiate remote recvmsg call.");
+        LOGE("transfer_fd_to_remote: remote recvmsg could not start");
         close_remote(remote_fd);
         return std::nullopt;
     }
-    LOGD("Remote recvmsg initiated, waiting for FD transfer...");
 
     // Prepare the local msghdr for sending the file descriptor.
     // The msg_control and msg_name fields of the local msghdr are set up.
@@ -372,7 +381,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     {
         auto *cmsg = CMSG_FIRSTHDR(&msg_hdr);
         if (!cmsg) {
-            LOGE("CMSG_FIRSTHDR returned null, internal error.");
+            LOGE("transfer_fd_to_remote: CMSG_FIRSTHDR returned null");
             close_remote(remote_fd);
             return std::nullopt;
         }
@@ -384,29 +393,27 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
 
     // Send the file descriptor from the injector to the remote process.
     if (sendmsg(local_socket, &msg_hdr, 0) == -1) {
-        PLOGE("Failed to send file descriptor to remote process.");
+        PLOGE("transfer_fd_to_remote: sendmsg");
         // We do not close local_lib_fd here as it might be transferred even if
         // sendmsg errors, or could be intended for further use. The destructor of
         // UniqueFd will handle it.
         close_remote(remote_fd);
         return std::nullopt;
     }
-    LOGD("Local FD %d sent to remote process.", local_lib_fd.operator const int &());
 
     // Complete the remote recvmsg call. This will retrieve the return value.
     auto recvmsg_result =
         static_cast<ssize_t>(remote_post_call(pid, regs, libc_return_addr));
     if (recvmsg_result == -1) {
         errno = get_remote_errno();
-        PLOGE("Remote recvmsg call failed.");
+        PLOGE("transfer_fd_to_remote: remote recvmsg");
         close_remote(remote_fd);
         return std::nullopt;
     }
-    LOGD("Remote recvmsg completed with result: %zd", recvmsg_result);
 
     // Read the control message buffer back from the remote process to extract the FD.
     if (read_proc(pid, remote_cmsgbuf, &cmsgbuf, sizeof(cmsgbuf)) != sizeof(cmsgbuf)) {
-        LOGE("Failed to read control message buffer from remote process.");
+        LOGE("transfer_fd_to_remote: read control message buffer failed");
         close_remote(remote_fd);
         return std::nullopt;
     }
@@ -415,15 +422,13 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     auto *cmsg = CMSG_FIRSTHDR(&msg_hdr);
     if (!cmsg || cmsg->cmsg_len != CMSG_LEN(sizeof(int)) || cmsg->cmsg_level != SOL_SOCKET ||
         cmsg->cmsg_type != SCM_RIGHTS) {
-        LOGE("Invalid control message received from remote process. Expected "
-             "SCM_RIGHTS.");
+        LOGE("transfer_fd_to_remote: remote control message is not SCM_RIGHTS");
         close_remote(remote_fd);
         return std::nullopt;
     }
 
     int transferred_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
-    LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd.operator const int &(),
-         transferred_fd);
+    LOGI("transfer_fd_to_remote: library fd=%d is remote fd=%d", local_lib_fd.operator const int &(), transferred_fd);
 
     // Close the remote socket.
     close_remote(remote_fd);
@@ -503,19 +508,17 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
                                               const std::vector<lsplt::MapInfo> &local_map,
                                               const std::vector<lsplt::MapInfo> &remote_map, int lib_fd,
                                               const char *lib_path, uintptr_t libc_return_addr) {
-    LOGD("Attempting remote dlopen for library: %s with FD: %d", lib_path, lib_fd);
-
     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "android_dlopen_ext");
     if (!dlopen_addr) {
-        LOGE("Failed to find 'android_dlopen_ext' in remote '%s'.", constants::kLibdlModule);
+        LOGE("remote_dlopen: no android_dlopen_ext in remote %s", constants::kLibdlModule);
         // Fallback to 'dlopen' if 'android_dlopen_ext' is not found.
         // This is a common pattern for broader compatibility.
         dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
         if (!dlopen_addr) {
-            LOGE("Failed to find 'dlopen' in remote '%s' either. Cannot load library.", constants::kLibdlModule);
+            LOGE("remote_dlopen: no dlopen in remote %s either; cannot load", constants::kLibdlModule);
             return std::nullopt;
         }
-        LOGW("Using 'dlopen' as 'android_dlopen_ext' was not found. FD passing might not be supported.");
+        LOGW("remote_dlopen: falling back to dlopen; fd passing may be unsupported");
         // If falling back to dlopen, FD passing is not directly supported, and `dlext_info` becomes irrelevant.
         //
         // In this case, `lib_path` would need to be a valid path accessible to the target process.
@@ -531,7 +534,7 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
     uintptr_t remote_path = push_string(pid, regs, lib_path);
 
     if (remote_info == 0 || remote_path == 0) {
-        LOGE("Failed to push dlopen arguments to remote memory.");
+        LOGE("remote_dlopen: push arguments failed");
         return std::nullopt;
     }
 
@@ -542,11 +545,11 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
 
     if (remote_handle == 0) {
         std::string error_msg = get_remote_dlerror(pid, regs, local_map, remote_map, libc_return_addr);
-        LOGE("Remote dlopen failed for library: %s. dlerror: %s", lib_path, error_msg.c_str());
+        LOGE("remote_dlopen: %s failed: %s", lib_path, error_msg.c_str());
         return std::nullopt;
     }
 
-    LOGI("Successfully loaded library '%s' in remote process. Handle: %p", lib_path,
+    LOGI("remote_dlopen: loaded %s handle=%p", lib_path,
          reinterpret_cast<void *>(remote_handle));
     return remote_handle;
 }
@@ -569,19 +572,16 @@ static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_stru
                                                   const std::vector<lsplt::MapInfo> &local_map,
                                                   const std::vector<lsplt::MapInfo> &remote_map,
                                                   uintptr_t remote_handle, uintptr_t libc_return_addr) {
-    LOGD("Attempting to find remote entry symbol '%s' in library handle %p.", entry_name,
-         reinterpret_cast<void *>(remote_handle));
-
     auto dlsym_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlsym");
     if (!dlsym_addr) {
-        LOGE("Failed to find 'dlsym' in remote '%s'.", constants::kLibdlModule);
+        LOGE("remote_find_entry: no dlsym in remote %s", constants::kLibdlModule);
         return std::nullopt;
     }
 
     // Push the entry symbol name string to the remote stack.
     uintptr_t remote_symbol = push_string(pid, regs, entry_name);
     if (remote_symbol == 0) {
-        LOGE("Failed to push entry symbol name to remote memory.");
+        LOGE("remote_find_entry: push symbol name failed");
         return std::nullopt;
     }
 
@@ -592,12 +592,15 @@ static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_stru
 
     if (entry_addr == 0) {
         std::string error_msg = get_remote_dlerror(pid, regs, local_map, remote_map, libc_return_addr);
-        LOGE("Failed to find entry symbol '%s' in remote library (handle %p). dlerror: %s", entry_name,
+        LOGE("remote_find_entry: no symbol %s in handle=%p: %s", entry_name,
              reinterpret_cast<void *>(remote_handle), error_msg.c_str());
         return std::nullopt;
     }
 
-    LOGI("Found entry point '%s' at remote address: %p", entry_name, reinterpret_cast<void *>(entry_addr));
+    LOGI("remote_find_entry: %s=%p", entry_name, reinterpret_cast<void *>(entry_addr));
+    // Found via a remote dlsym rather than find_func_addr, so register it for the "call %s" trace
+    // of invoking it below.
+    register_symbol(entry_addr, entry_name);
     return entry_addr;
 }
 
@@ -615,16 +618,13 @@ static std::optional<uintptr_t> remote_find_entry(int pid, struct user_regs_stru
  */
 static bool remote_call_entry(int pid, struct user_regs_struct &regs, uintptr_t entry_addr, uintptr_t remote_handle,
                               uintptr_t libc_return_addr) {
-    LOGD("Attempting to call remote entry point at address %p with handle %p.", reinterpret_cast<void *>(entry_addr),
-         reinterpret_cast<void *>(remote_handle));
-
     // Arguments for the entry point (typically just the library handle).
     std::vector<uintptr_t> args = {remote_handle};
     uintptr_t result = remote_call(pid, regs, entry_addr, libc_return_addr, args);
 
     // The return value of the entry point is logged, but not necessarily checked for success.
     // The interpretation of the return value depends on the injected library's contract.
-    LOGI("Remote entry point call completed. Return value: %p", reinterpret_cast<void *>(result));
+    LOGI("remote_call_entry: returned %p", reinterpret_cast<void *>(result));
     return true; // Return true if the call itself completed, regardless of its return value.
 }
 
@@ -641,7 +641,7 @@ public:
 
     ~ScopedFileDeleter() {
         if (!path_.empty()) {
-            LOGD("Cleaning up staged file: %s", path_.c_str());
+            LOGD("~ScopedFileDeleter: removing %s", path_.c_str());
             unlink(path_.c_str());
         }
     }
@@ -666,11 +666,11 @@ static bool copy_file(const char* src, const char* dst) {
     std::ofstream dst_file(dst, std::ios::binary);
 
     if (!src_file) {
-        PLOGE("Failed to open source file for copying: %s", src);
+        PLOGE("copy_file: open source %s", src);
         return false;
     }
     if (!dst_file) {
-        PLOGE("Failed to open destination file for copying: %s", dst);
+        PLOGE("copy_file: open destination %s", dst);
         return false;
     }
 
@@ -698,7 +698,7 @@ static std::optional<uintptr_t> inject_via_staging(int pid, struct user_regs_str
                                                    const std::vector<lsplt::MapInfo> &local_map,
                                                    const std::vector<lsplt::MapInfo> &remote_map,
                                                    const char *lib_path, uintptr_t libc_return_addr) {
-    LOGI("Initiating Staging Fallback mechanism...");
+    LOGI("inject_via_staging: falling back to a staged copy");
 
     // Generate a random path in /data/local/tmp
     // /data/local/tmp is chosen because it is traversable by most contexts.
@@ -708,32 +708,32 @@ static std::optional<uintptr_t> inject_via_staging(int pid, struct user_regs_str
     // The kernel keeps the inode alive for the mapped process even after unlink.
     ScopedFileDeleter file_guard(staged_path);
 
-    LOGD("Staging library to: %s", staged_path.c_str());
+    LOGD("inject_via_staging: staging to %s", staged_path.c_str());
 
     //  Copy the library
     if (!copy_file(lib_path, staged_path.c_str())) {
-        LOGE("Failed to copy library during staging.");
+        LOGE("inject_via_staging: copy failed");
         return std::nullopt;
     }
 
     // Set Permissions to 644 (RW-R--R--)
     // This allows the target process (likely running as a specific UID) to read the file.
     if (chmod(staged_path.c_str(), 0644) != 0) {
-        PLOGE("Failed to chmod staged file.");
+        PLOGE("inject_via_staging: chmod");
         return std::nullopt;
     }
 
     // Resolve 'dlopen' in the remote process
     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
     if (!dlopen_addr) {
-        LOGE("Failed to find 'dlopen' in remote process.");
+        LOGE("inject_via_staging: no remote dlopen");
         return std::nullopt;
     }
 
     // Push the staged path to remote memory
     uintptr_t remote_path_addr = push_string(pid, regs, staged_path.c_str());
     if (remote_path_addr == 0) {
-        LOGE("Failed to push staged path string to remote memory.");
+        LOGE("inject_via_staging: push staged path failed");
         return std::nullopt;
     }
 
@@ -744,11 +744,11 @@ static std::optional<uintptr_t> inject_via_staging(int pid, struct user_regs_str
 
     if (handle == 0) {
         std::string error_msg = get_remote_dlerror(pid, regs, local_map, remote_map, libc_return_addr);
-        LOGE("Staged dlopen failed. dlerror: %s", error_msg.c_str());
+        LOGE("inject_via_staging: dlopen failed: %s", error_msg.c_str());
         return std::nullopt;
     }
 
-    LOGI("Successfully loaded staged library. Handle: %p", reinterpret_cast<void*>(handle));
+    LOGI("inject_via_staging: loaded handle=%p", reinterpret_cast<void*>(handle));
     return handle;
 }
 
@@ -764,13 +764,11 @@ public:
      * @param target_pid The PID of the process to attach to.
      */
     explicit PtraceAttachment(int target_pid) : pid_(target_pid), attached_(false) {
-        LOGD("Attempting to attach to process %d...", pid_);
         if (ptrace(PTRACE_ATTACH, pid_, 0, 0) == -1) {
-            PLOGE("Failed to attach to process %d.", pid_);
+            PLOGE("PtraceAttachment: PTRACE_ATTACH pid=%d", pid_);
             return;
         }
         attached_ = true;
-        LOGI("Successfully attached to process %d.", pid_);
     }
 
     /**
@@ -778,11 +776,10 @@ public:
      */
     ~PtraceAttachment() {
         if (attached_) {
-            LOGD("Attempting to detach from process %d...", pid_);
             if (ptrace(PTRACE_DETACH, pid_, 0, 0) == -1) {
-                PLOGE("Failed to detach from process %d. Manual cleanup might be required.", pid_);
+                PLOGE("~PtraceAttachment: PTRACE_DETACH pid=%d (manual cleanup may be needed)", pid_);
             } else {
-                LOGI("Successfully detached from process %d.", pid_);
+                LOGI("~PtraceAttachment: detached pid=%d", pid_);
             }
         }
     }
@@ -813,9 +810,9 @@ public:
     ~RegisterRestorer() {
         // Always restore registers when this object goes out of scope
         if (set_regs(pid_, regs_)) {
-            LOGD("Original registers for process %d restored.", pid_);
+            LOGD("~RegisterRestorer: registers restored pid=%d", pid_);
         } else {
-            PLOGE("Failed to restore original registers for process %d.", pid_);
+            PLOGE("~RegisterRestorer: restore registers pid=%d", pid_);
         }
     }
 private:
@@ -837,39 +834,44 @@ private:
  * @return True if injection was successful, false otherwise.
  */
 bool inject_library(int pid, const char *lib_path, const char *entry_name) {
-    LOGI("Starting injection of library '%s' (entry: '%s') into process %d.", lib_path, entry_name, pid);
+    // Name what is actually running under that pid, so an injection into a recycled pid (the
+    // target died and something unrelated inherited the number) is distinguishable from the real
+    // thing.
+    const std::string exe = get_program(pid);
+    const Elapsed inject_el;
+    LOGI("inject_library: start target=%d exe=%s lib=%s entry=%s", pid, exe.empty() ? "?" : exe.c_str(),
+         lib_path, entry_name);
 
     // 1. Ptrace attachment using RAII.
     PtraceAttachment ptrace_guard(pid);
     if (!ptrace_guard.is_attached()) {
-        LOGE("Failed to attach to target process %d.", pid);
+        LOGE("inject_library: attach to target=%d failed", pid);
         return false;
     }
 
     // 2. Wait for the target process to stop after attachment.
     int status;
     if (!wait_for_trace(pid, &status, __WALL)) {
-        LOGE("Failed to wait for target process %d to stop after attachment.", pid);
+        LOGE("inject_library: target=%d did not stop after attach", pid);
         return false;
     }
 
     // Verify the stop reason is SIGSTOP (expected after PTRACE_ATTACH).
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
-        LOGE("Target process %d stopped for an unexpected reason: %s (expected SIGSTOP).", pid,
+        LOGE("inject_library: target=%d stopped by %s, expected SIGSTOP", pid,
              parse_status(status).c_str());
         return false;
     }
-    LOGD("Target process %d successfully stopped by SIGSTOP.", pid);
+    LOGD("inject_library: attached target=%d (SIGSTOP)", pid);
 
     // 3. Backup and retrieve current registers.
     // Registers are manipulated during remote calls and must be restored afterwards.
     struct user_regs_struct current_regs{}, backup_regs{};
     if (!get_regs(pid, current_regs)) {
-        LOGE("Failed to get registers for target process %d.", pid);
+        LOGE("inject_library: get registers target=%d failed", pid);
         return false;
     }
     backup_regs = current_regs; // Store a copy for restoration.
-    LOGD("Process %d registers backed up.", pid);
 
     // Skip the Red Zone (128 bytes) on x86_64 to prevent stack corruption
     #if defined(__x86_64__)
@@ -882,20 +884,19 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
     // Create a scope to ensure RAII objects are destroyed BEFORE register restoration
     {
         // 4. Scan local and remote memory maps to resolve function addresses.
-        LOGD("Scanning memory maps for target process %d...", pid);
         std::vector<lsplt::MapInfo> remote_map = lsplt::MapInfo::Scan(std::to_string(pid));
         std::vector<lsplt::MapInfo> local_map = lsplt::MapInfo::Scan();
-        LOGD("Memory maps scanned.");
+        LOGD("inject_library: maps remote=%zu local=%zu", remote_map.size(), local_map.size());
 
         // 5. Find a suitable return address within libc.so for remote calls.
         // This address is used to ensure remote calls return to a safe and controlled location.
         auto libc_return_addr = find_module_return_addr(remote_map, constants::kLibcModule);
         if (!libc_return_addr) {
-            LOGE("Failed to find a suitable return address for '%s' in target process %d.", constants::kLibcModule,
+            LOGE("inject_library: no return address in %s for target=%d", constants::kLibcModule,
                  pid);
             return false;
         }
-        LOGD("Found libc return address: %p", reinterpret_cast<void *>(libc_return_addr));
+        LOGD("inject_library: libc return address=%p", reinterpret_cast<void *>(libc_return_addr));
 
         // 6. Attempt to transfer the library's file descriptor to the remote process.
         int remote_fd = -1;
@@ -909,11 +910,10 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
             remote_lib_guard.emplace(pid, remote_fd);
             remote_lib_guard->set_libc_return_addr(reinterpret_cast<uintptr_t>(libc_return_addr));
 
-            LOGD("FD Transfer successful (FD: %d). Attempting android_dlopen_ext...", remote_fd);
             handle_opt = remote_dlopen(pid, current_regs, local_map, remote_map, remote_fd, lib_path,
                                        reinterpret_cast<uintptr_t>(libc_return_addr));
         } else {
-            LOGW("Failed to transfer library file descriptor for '%s' to target process %d.", lib_path, pid);
+            LOGW("inject_library: fd transfer of %s to target=%d failed", lib_path, pid);
         }
 
         // 7. Staging Fallback (Copy-Inject-Delete) if FD transfer failed.
@@ -922,7 +922,7 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
                                             lib_path, reinterpret_cast<uintptr_t>(libc_return_addr));
         }
         if (!handle_opt || *handle_opt == 0) {
-            LOGE("Failed to load library '%s' in remote process %d.", lib_path, pid);
+            LOGE("inject_library: load %s in target=%d failed", lib_path, pid);
             // If dlopen fails, the remote_lib_guard.fd() is still valid in the target process and needs to be closed.
             // The RemoteLibraryHandle constructor takes care of this.
             return false;
@@ -934,7 +934,7 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
         auto entry_opt = remote_find_entry(pid, current_regs, entry_name, local_map, remote_map,
                                            handle, reinterpret_cast<uintptr_t>(libc_return_addr));
         if (!entry_opt) {
-            LOGE("Failed to find entry point '%s' in remote library (handle %p).", entry_name,
+            LOGE("inject_library: no entry %s in handle=%p", entry_name,
                  reinterpret_cast<void *>(handle));
             return false;
         }
@@ -943,12 +943,13 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
         // 9. Call the remote entry point function.
         if (!remote_call_entry(pid, current_regs, entry_addr, handle,
                                reinterpret_cast<uintptr_t>(libc_return_addr))) {
-            LOGE("Failed to call remote entry point '%s'.", entry_name);
+            LOGE("inject_library: call entry %s failed", entry_name);
             return false;
         }
     }
 
-    LOGI("Library injection completed successfully for process %d.", pid);
+    LOGI("inject_library: done target=%d exe=%s lib=%s rc=1 %llums", pid, exe.empty() ? "?" : exe.c_str(),
+         lib_path, inject_el.Ms());
     return true;
 }
 
@@ -1003,14 +1004,15 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    LOGI("TEESimulator injector starting...");
     bool success = inject::inject_library(pid, resolved_path, entry_name);
 
     if (success) {
-        LOGI("Injection completed successfully.");
         return EXIT_SUCCESS;
     } else {
-        LOGE("Injection failed.");
+        // Every stage inside inject_library logs its own failure; this names the attempt the reader
+        // should scroll back to.
+        LOGE("main: inject FAILED target=%d lib=%s entry=%s; see the stage failure above", pid, resolved_path,
+             entry_name);
         return EXIT_FAILURE;
     }
 }

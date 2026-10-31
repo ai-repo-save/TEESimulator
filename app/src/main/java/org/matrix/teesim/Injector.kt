@@ -29,7 +29,7 @@ class Injector(private val moduleDir: File) {
         running = true
         if (!injectBin.exists() || !libFile.exists()) {
             SystemLogger.error(
-                "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
+                "Injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
                     "under ${moduleDir.absolutePath}/$abi"
             )
         }
@@ -41,22 +41,37 @@ class Injector(private val moduleDir: File) {
     }
 
     private fun loop() {
-        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
+        SystemLogger.info("Injector: watching $procName (abi=$abi lib=$libName)")
         var failures = 0
         while (running) {
-            val pid = findPid(procName)
-            // Tell the log tail which process to capture, so the Logs panel shows the
-            // target keystore's own output — even before we manage to inject it.
+            // The full /proc walk in findPid touches every process's cmdline (~1000 reads on a
+            // busy device); skip it while the pid we last injected is still alive, since it never
+            // changes between keystore restarts. Fall back to the walk only once it's gone. The
+            // fallback fires at most once per keystore restart (or per retry while injection keeps
+            // failing), so log it; the common alive-pid path stays silent to keep the loop cheap.
+            val pid =
+                if (lastPid > 0 && isNamedProcess(lastPid, procName)) {
+                    lastPid
+                } else {
+                    if (lastPid > 0) {
+                        SystemLogger.debug(
+                            "Injector: pid=$lastPid is no longer $procName; re-scanning /proc"
+                        )
+                    }
+                    findPid(procName)
+                }
+            // Tell the log tail which process to capture, so the Logs panel shows the target
+            // keystore's own output — even before we manage to inject it.
             LogTail.targetPid = if (pid > 0) pid else -1
             if (pid > 0 && pid != lastPid && serviceReady()) {
                 if (inject(pid)) {
                     lastPid = pid
                     failures = 0
-                    SystemLogger.info("injector: injected into $procName pid=$pid")
+                    SystemLogger.info("Injector: injected into $procName pid=$pid")
                     confirmAsync(pid)
                 } else {
                     failures++
-                    SystemLogger.warning("injector: injection into pid=$pid failed; will retry")
+                    SystemLogger.warning("Injector: injection into pid=$pid failed; will retry")
                 }
             } else if (pid <= 0) {
                 lastPid = -1 // process gone; force re-inject when it returns
@@ -66,8 +81,10 @@ class Injector(private val moduleDir: File) {
         }
     }
 
-    /** keystore forks before it registers its binder; wait for the service so we don't
-     * inject into a half-initialised process. */
+    /**
+     * keystore forks before it registers its binder; wait for the service so we don't inject into a
+     * half-initialised process.
+     */
     private fun serviceReady(): Boolean {
         val name =
             if (api >= 31) "android.system.keystore2.IKeystoreService/default"
@@ -79,19 +96,24 @@ class Injector(private val moduleDir: File) {
         }
     }
 
-    /** The control-channel hello is the real proof the lib loaded and bound the control socket. Warn
-     * (don't re-inject — that risks double-hooking) if it never arrives. */
+    /**
+     * The control-channel hello is the real proof the lib loaded and bound the control socket. Warn
+     * (don't re-inject — that risks double-hooking) if it never arrives.
+     */
     private fun confirmAsync(pid: Int) {
-        Thread({
-                for (i in 0 until 24) { // ~12s
-                    if (Control.libApi != 0) return@Thread
-                    sleep(500)
-                }
-                SystemLogger.warning(
-                    "injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
-                        "(SELinux on the control socket? look for 'avc: denied' in logcat)"
-                )
-            }, "teesim-inject-confirm")
+        Thread(
+                {
+                    for (i in 0 until 24) { // ~12s
+                        if (Control.libApi != 0) return@Thread
+                        sleep(500)
+                    }
+                    SystemLogger.warning(
+                        "Injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
+                            "(SELinux on the control socket? look for 'avc: denied' in logcat)"
+                    )
+                },
+                "teesim-inject-confirm",
+            )
             .apply {
                 isDaemon = true
                 start()
@@ -111,12 +133,25 @@ class Injector(private val moduleDir: File) {
                     .start()
             val output = proc.inputStream.bufferedReader().readText()
             val code = proc.waitFor()
-            if (code != 0) SystemLogger.warning("injector: inject exit=$code output=$output")
+            if (code != 0) SystemLogger.warning("Injector: inject exit=$code output=$output")
             code == 0
         } catch (e: Exception) {
-            SystemLogger.error("injector: failed to run inject binary", e)
+            SystemLogger.error("Injector: failed to run inject binary", e)
             false
         }
+    }
+
+    /** True if /proc/[pid]/cmdline's basename still matches [name], else false. */
+    private fun isNamedProcess(pid: Int, name: String): Boolean {
+        val cmd =
+            try {
+                File("/proc/$pid/cmdline").readBytes()
+            } catch (e: Exception) {
+                return false
+            }
+        if (cmd.isEmpty()) return false
+        val end = cmd.indexOf(0.toByte()).let { if (it < 0) cmd.size else it }
+        return String(cmd, 0, end).substringAfterLast('/') == name
     }
 
     /** Return the pid whose /proc/<pid>/cmdline basename matches [name], else -1. */

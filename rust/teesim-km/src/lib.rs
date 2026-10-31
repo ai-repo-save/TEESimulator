@@ -246,6 +246,29 @@ impl Ta {
             cfg.verified_boot_state,
             &cfg.verified_boot_hash,
         );
+        // The whole profile this TA attests with, once, in the same hex the daemon's harvest line
+        // uses, so the two can be compared directly.
+        log::info!(
+            "new_ex: ready level={} attestation_version={} boot_key={} locked={} vb_state={:?} \
+             boot_hash={} os_version={} os_patchlevel={} vendor_patchlevel={} \
+             boot_patchlevel={} ids={}",
+            match security_level {
+                SecurityLevel::Strongbox => "StrongBox",
+                SecurityLevel::Software => "SW",
+                _ => "TEE",
+            },
+            attestation_version,
+            resign::hex(&cfg.verified_boot_key),
+            cfg.device_boot_locked,
+            verified_boot_state,
+            resign::hex(&cfg.verified_boot_hash),
+            cfg.os_version,
+            cfg.os_patchlevel,
+            cfg.vendor_patchlevel,
+            cfg.boot_patchlevel,
+            if attestation_ids.is_some() { "profile" } else { "device" }
+        );
+
         // These fields double as the attestation record's root of trust and as
         // inputs to the KEK derivation. The daemon supplies the device's real,
         // frozen values, so the KEK stays stable across reboots and every profile

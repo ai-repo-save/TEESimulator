@@ -6,18 +6,110 @@
 
 use crate::{Ta, TaConfig};
 use kmr_wire::types::AttestationIdInfo;
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
-/// Install the logcat logger and the panic hook. Idempotent; called by every
-/// entry point that can be the first one reached.
+extern "C" {
+    /// The one emitter every line in the module goes through, C++ and Rust alike
+    /// (common/log_context.cpp). It stamps the subsystem and the request context and rate-limits a
+    /// D/V flood — so the reference TA's own `trace!` cannot drown logd. There is no level floor:
+    /// routing the Rust side through it is what makes one line shape rather than two, and what
+    /// means the vendored TA's own tracing is never a second, ungated backend.
+    fn teesim_log(prio: c_int, sub: *const c_char, fmt: *const c_char, ...);
+}
+
+// ANDROID_LOG_* priorities, as in <android/log.h>.
+const PRIO_VERBOSE: c_int = 2;
+const PRIO_DEBUG: c_int = 3;
+const PRIO_INFO: c_int = 4;
+const PRIO_WARN: c_int = 5;
+const PRIO_ERROR: c_int = 6;
+const PRIO_FATAL: c_int = 7;
+
+/// Hand one already-formatted line to the shared emitter.
+///
+/// The message goes in as a `%s` argument rather than as the format string, so a certificate subject
+/// or a package name can never be read as a conversion specifier.
+fn emit(prio: c_int, sub: &str, msg: &str) {
+    // A NUL inside either would truncate the C string silently; neither can legitimately contain one.
+    let sub = sub.replace('\0', "?");
+    let msg = msg.replace('\0', "?");
+    let (Ok(sub), Ok(msg)) = (CString::new(sub), CString::new(msg)) else {
+        return;
+    };
+    // SAFETY: both pointers are NUL-terminated and live for the duration of the call, and the format
+    // string has exactly the one conversion the single argument supplies.
+    unsafe { teesim_log(prio, sub.as_ptr(), b"%s\0".as_ptr().cast::<c_char>(), msg.as_ptr()) };
+}
+
+/// The subsystem token for a record, derived from its module path.
+///
+/// `teesim_km::resign` becomes `ta/resign` and the vendored `kmr_ta::…` becomes `ta/kmr_ta`, so the
+/// reference TA's own lines are filterable apart from ours while both stay under the `ta` prefix.
+fn subsystem(module_path: &str) -> String {
+    let mut parts = module_path.split("::");
+    match (parts.next(), parts.next()) {
+        (Some("teesim_km"), Some(module)) => format!("ta/{module}"),
+        (Some("teesim_km"), None) => "ta/km".to_string(),
+        (Some(krate), _) if !krate.is_empty() => format!("ta/{krate}"),
+        _ => "ta".to_string(),
+    }
+}
+
+struct TeesimLogger;
+
+impl log::Log for TeesimLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        let prio = match record.level() {
+            log::Level::Error => PRIO_ERROR,
+            log::Level::Warn => PRIO_WARN,
+            log::Level::Info => PRIO_INFO,
+            log::Level::Debug => PRIO_DEBUG,
+            log::Level::Trace => PRIO_VERBOSE,
+        };
+        let module = record.module_path().unwrap_or_default();
+        let msg = record.args().to_string();
+        // The reference TA prints the boot and HAL info it is handed at INFO, as Debug-formatted
+        // byte arrays. "TA ready" states the same values once, in hex, so these drop to DEBUG.
+        let prio = if prio == PRIO_INFO
+            && module.starts_with("kmr_ta")
+            && (msg.starts_with("Setting boot_info") || msg.starts_with("Setting hal_info"))
+        {
+            PRIO_DEBUG
+        } else {
+            prio
+        };
+        emit(prio, &subsystem(module), &msg);
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: TeesimLogger = TeesimLogger;
+
+/// Install the logger and the panic hook. Idempotent; called by every entry point that can be the
+/// first one reached.
 fn init_logging() {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
-            .with_tag("TEESimulator"),
-    );
-    std::panic::set_hook(Box::new(|info| log::error!("teesim_km panic: {info}")));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = log::set_logger(&LOGGER);
+        // No dial: every record this crate or the vendored reference TA produces reaches the
+        // shared emitter, which is the only place volume gets reduced (its rate limiter), never
+        // filtered by category. Set once, forever, at the most permissive level `log` has.
+        log::set_max_level(log::LevelFilter::Trace);
+        std::panic::set_hook(Box::new(|info| {
+            // `log` has no Fatal, so a panic — the one thing here that really is fatal, unwinding
+            // inside keystore2 — could only ever be logged as an error. Emit it at FATAL directly,
+            // where `grep -E " [WEF] TEESimulator"` and the collector's crash handling both find it.
+            emit(PRIO_FATAL, "ta", &format!("panic: {info}"));
+        }));
+    });
 }
 
 /// Copy `len` bytes at `ptr` into an owned buffer; empty for a null/zero span.

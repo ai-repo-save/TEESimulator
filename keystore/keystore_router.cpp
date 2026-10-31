@@ -36,7 +36,10 @@
 #include <vector>
 
 #include "control.h"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "ks1"
 #include "logging.hpp"
+#include "km_names.h"
 #include "teesim_km.h"
 
 using namespace android;
@@ -67,6 +70,36 @@ const TxCodes& Codes() {
   return codes;
 }
 
+// The IKeystoreService method a transaction code names on this release, for the log.
+const char* TxName(uint32_t code) {
+  const TxCodes& tx = Codes();
+  if (code == tx.del) return "del";
+  if (code == tx.exist) return "exist";
+  if (code == tx.generateKey) return "generateKey";
+  if (code == tx.getKeyCharacteristics) return "getKeyCharacteristics";
+  if (code == tx.exportKey) return "exportKey";
+  if (code == tx.attestKey) return "attestKey";
+  if (code == tx.begin) return "begin";
+  if (code == tx.update) return "update";
+  if (code == tx.finish) return "finish";
+  if (code == tx.abort) return "abort";
+  return "?";
+}
+
+// KeyPurpose by name (keymaster and KeyMint share the numbering).
+const char* PurposeName(int32_t purpose) {
+  switch (purpose) {
+    case 0: return "ENCRYPT";
+    case 1: return "DECRYPT";
+    case 2: return "SIGN";
+    case 3: return "VERIFY";
+    case 5: return "WRAP_KEY";
+    case 6: return "AGREE_KEY";
+    case 7: return "ATTEST_KEY";
+    default: return "?";
+  }
+}
+
 // KeyMint/Keymaster tag values (shared) and enum constants we need.
 enum {
   TAG_PURPOSE = 0x20000001,
@@ -78,7 +111,11 @@ enum {
   TAG_ATTESTATION_CHALLENGE = 0x900002c4,        // 0x90000000 | 708
   TAG_ATTESTATION_APPLICATION_ID = 0x900002c5,   // 0x90000000 | 709
   TAG_ORIGIN = 0x100002be,                       // KM_ENUM | 702
+  ALGORITHM_RSA = 1,
   ALGORITHM_EC = 3,
+  ALGORITHM_AES = 32,
+  ALGORITHM_TRIPLE_DES = 33,
+  ALGORITHM_HMAC = 128,
   KEY_FORMAT_PKCS8 = 1,
   KS_NO_ERROR = 1,
   KS_SYSTEM_ERROR = 4,
@@ -86,6 +123,18 @@ enum {
   KM_SEC_SOFTWARE = 0,
   KM_SEC_KEYSTORE = 100,  // KeyMint SecurityLevel::Keystore; Keystore1 reports these as software
 };
+
+// The algorithm a log line names, so a forwarded key says what it was rather than a bare number.
+const char* AlgorithmName(int64_t algorithm) {
+  switch (algorithm) {
+    case ALGORITHM_RSA: return "RSA";
+    case ALGORITHM_EC: return "EC";
+    case ALGORITHM_AES: return "AES";
+    case ALGORITHM_TRIPLE_DES: return "3DES";
+    case ALGORITHM_HMAC: return "HMAC";
+    default: return "unknown-algorithm";
+  }
+}
 
 namespace {
 
@@ -406,7 +455,7 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
   int32_t rc = teesim_km_generate_key(ta.get(), params.data(), params.size(), nullptr, 0, nullptr, 0,
                                       nullptr, 0, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA generate_key failed rc=%d", rc);
+    LOGE("ImportKey: TA generate_key failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return nullptr;
   }
   return res;
@@ -519,7 +568,7 @@ bool AttestExisting(PendingKey& k, int uid, const std::vector<KmParam>& extra) {
   int32_t rc = teesim_km_attest_key(ta.get(), k.ta_blob.data(), k.ta_blob.size(), params.data(),
                                     params.size(), nullptr, 0, nullptr, 0, nullptr, 0, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA attest_key failed rc=%d", rc);
+    LOGE("AttestExisting: TA attest_key failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return false;
   }
   bool ok = StoreAttestChain(k, res);
@@ -559,6 +608,19 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
   std::vector<std::vector<uint8_t>> blobs;
   std::vector<KmParam> params;
   if (in.readInt32() == 1) params = ReadKeymasterArguments(in, blobs);
+  LOGI("generateKey: alias=%s params=%s", String8(alias).c_str(),
+       KmDescribeParams(params.data(), params.size()).c_str());
+
+  // Only asymmetric keys are worth simulating: they carry the attestation, and they are the only
+  // kind this path can produce. A symmetric key (AES/3DES/HMAC) is never attested and lives entirely
+  // in the real keymaster; claiming one here would report success while recording no key the real
+  // keystore can see, so the app's first Cipher.init fails with KEY_NOT_FOUND (#291).
+  const int64_t algorithm = ParamInt(params, TAG_ALGORITHM, 0);
+  if (algorithm != ALGORITHM_RSA && algorithm != ALGORITHM_EC) {
+    LOGI("generateKey: alias=%s is a %s key, not asymmetric; forwarding to the real keystore",
+         String8(alias).c_str(), AlgorithmName(algorithm));
+    return false;
+  }
 
   PendingKey key;
   key.params = std::move(params);
@@ -569,7 +631,7 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto& stored = g_keys[KeyId(uid, alias)] = std::move(key);
     if (!MintOnce(stored, uid, {}, HasTag(stored.params, TAG_ATTESTATION_CHALLENGE))) {
-      LOGE("keystore: generateKey mint failed alias=%s", String8(alias).c_str());
+      LOGE("generateKey: FAILED, the TA declined to mint alias=%s", String8(alias).c_str());
       g_keys.erase(KeyId(uid, alias));
       return false;
     }
@@ -580,7 +642,7 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
       hw = stored.params;
     }
   }
-  LOGI("keystore: generateKey simulated alias=%s sw=%zu hw=%zu", String8(alias).c_str(), sw.size(),
+  LOGI("generateKey: simulated alias=%s sw=%zu hw=%zu", String8(alias).c_str(), sw.size(),
        hw.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreKeyCharacteristicsCallback");
@@ -599,7 +661,10 @@ bool HandleGetKeyCharacteristics(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("getKeyCharacteristics: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     if (!it->second.hw_chars.empty() || !it->second.sw_chars.empty()) {
       sw = it->second.sw_chars;
       hw = it->second.hw_chars;
@@ -624,9 +689,12 @@ bool HandleExportKey(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("exportKey: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     if (!EnsureTaKey(it->second, uid)) {
-      LOGE("keystore: key setup failed");
+      LOGE("exportKey: FAILED, could not materialise the key in the TA");
       return false;
     }
     spki = it->second.spki;
@@ -654,25 +722,28 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
     if (p.tag == TAG_ATTESTATION_CHALLENGE || p.tag == TAG_ATTESTATION_APPLICATION_ID)
       extra.push_back(p);
   }
-  LOGI("keystore: attest params challenge=%d appId=%d",
-       (int)std::count_if(attest_params.begin(), attest_params.end(),
-                          [](const KmParam& p) { return p.tag == TAG_ATTESTATION_CHALLENGE; }),
-       (int)std::count_if(attest_params.begin(), attest_params.end(),
-                          [](const KmParam& p) { return p.tag == TAG_ATTESTATION_APPLICATION_ID; }));
+  LOGI("attestKey: params=%s", KmDescribeParams(attest_params.data(), attest_params.size()).c_str());
 
   std::vector<std::vector<uint8_t>> chain;
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("attestKey: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     if (it->second.ta_blob.empty()) {
-      if (!MintOnce(it->second, uid, extra, true)) return false;
+      if (!MintOnce(it->second, uid, extra, true)) {
+        LOGE("attestKey: FAILED, the TA declined to mint and attest the key");
+        return false;
+      }
     } else if (!AttestExisting(it->second, uid, extra)) {
+      LOGE("attestKey: FAILED, the TA declined to re-attest the key");
       return false;
     }
     chain = it->second.certs;
   }
-  LOGI("keystore: attestKey simulated alias=%s certs=%zu", String8(alias).c_str(), chain.size());
+  LOGI("attestKey: simulated alias=%s certs=%zu", String8(alias).c_str(), chain.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreCertificateChainCallback");
   InvokeCallback(cb, kCb, [&](Parcel& p) {
@@ -705,14 +776,25 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
-    if (!EnsureTaKey(it->second, uid)) return false;
+    if (it == g_keys.end()) {
+      LOGD("begin: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
+    if (!EnsureTaKey(it->second, uid)) {
+      LOGE("begin: FAILED, could not materialise the key in the TA");
+      return false;
+    }
     blob = it->second.ta_blob;
   }
 
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
-  if (!ta) return false;
+  if (!ta) {
+    LOGE("begin: FAILED, no TA configured for uid %d and no default; forwarding is not possible "
+         "here because the key is ours",
+         uid);
+    return false;
+  }
   TsBeginResult* res = nullptr;
   // The legacy keystore1 HAL carries auth tokens through its own mechanism, not the flat token structs
   // the keystore2 path uses, so no auth token is forwarded here yet (unchanged behavior). Auth-bound
@@ -720,7 +802,7 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   int32_t rc = teesim_km_begin(ta.get(), purpose, blob.data(), blob.size(), op_params.data(),
                                op_params.size(), /*auth_token=*/nullptr, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA begin failed rc=%d", rc);
+    LOGE("begin: TA begin failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return false;
   }
   std::vector<std::vector<uint8_t>> out_blobs;
@@ -749,7 +831,8 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     std::lock_guard<std::mutex> lk(g_ops_mutex);
     g_ops[token.get()] = {token, op_handle, ta};
   }
-  LOGI("keystore: begin purpose=%d alias=%s out_params=%zu", purpose, String8(alias).c_str(),
+  LOGD("begin: purpose=%s alias=%s params=%s out_params=%zu", PurposeName(purpose),
+       String8(alias).c_str(), KmDescribeParams(op_params.data(), op_params.size()).c_str(),
        out_params.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreOperationResultCallback");
@@ -789,7 +872,10 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) {
+    LOGD("update: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
@@ -800,7 +886,7 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
     output.assign(out, out + out_len);
     teesim_km_free_buf(out, out_len);
   } else if (rc != 0) {
-    LOGE("keystore: TA update failed rc=%d", rc);
+    LOGE("update: TA update failed rc=%d(%s)", rc, teesim_km_err_name(rc));
   }
 
   DeliverOperationResult(cb, rc, token, static_cast<int32_t>(input.size()), output);
@@ -821,7 +907,10 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+    LOGD("finish: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
@@ -834,9 +923,9 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
     output.assign(out, out + out_len);
     teesim_km_free_buf(out, out_len);
   } else if (rc != 0) {
-    LOGE("keystore: TA finish failed rc=%d", rc);
+    LOGE("finish: TA finish failed rc=%d(%s)", rc, teesim_km_err_name(rc));
   }
-  LOGI("keystore: finish output=%zu", output.size());
+  LOGD("finish: output=%zu", output.size());
 
   DeliverOperationResult(cb, rc, token, static_cast<int32_t>(input.size()), output);
   ReplyStatus(reply, KS_NO_ERROR);
@@ -855,10 +944,13 @@ bool HandleDel(int calling_uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("del: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     g_keys.erase(it);
   }
-  LOGI("keystore: del simulated alias=%s uid=%d", String8(alias).c_str(), uid);
+  LOGI("del: simulated alias=%s uid=%d", String8(alias).c_str(), uid);
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
 }
@@ -868,7 +960,10 @@ bool HandleExist(int calling_uid, Parcel& in, Parcel* reply) {
   int uid = ResolveKeyUid(calling_uid, in.readInt32());
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
-    if (g_keys.find(KeyId(uid, alias)) == g_keys.end()) return false;  // not ours; forward
+    if (g_keys.find(KeyId(uid, alias)) == g_keys.end()) {
+      LOGD("exist: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
   }
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
@@ -879,7 +974,10 @@ bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
   sp<IBinder> token = in.readStrongBinder();
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+    LOGD("abort: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
   teesim_km_abort(ta.get(), op_handle);
 
   static const String16 kCb("android.security.keystore.IKeystoreResponseCallback");
@@ -895,6 +993,12 @@ extern "C" const char* teesim_hook_name(void) { return "keystore1"; }
 // Usage stats are a keystore2/KeyMint-only feature; Android 10/11 is out of scope
 // for the scope picker, so this router reports an empty array (see control.h).
 extern "C" char* teesim_usage_json_alloc(void) { return strdup("[]"); }
+
+// RKP is a keystore2/Android-12+ construct; the keystore1 path never resolves a remotely-provisioned
+// key, so there is nothing to track here (see control.h). Accept the pushed set as a no-op and never
+// report a reassertion.
+extern "C" void teesim_cfg_set_rkp_deleted(const char* const* /*names*/, size_t /*n*/) {}
+extern "C" char* teesim_rkp_reassert_json_alloc(void) { return strdup("[]"); }
 
 // Config-staging API (see common/control.h). teesim_cfg_begin/add_profile run on
 // the control thread; only teesim_cfg_commit touches the live routing tables.
@@ -917,7 +1021,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
                              g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state,
                              g_stage_attest_version_tee, g_stage_attest_version_strongbox, p->ids);
   if (!ta) {
-    LOGE("keystore: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
+    LOGE("teesim_cfg_add_profile: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
     return false;
   }
   Profile prof;
@@ -935,7 +1039,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     if (p->uid_app_ids && p->uid_app_id_lens && p->uid_app_ids[i] && p->uid_app_id_lens[i] > 0) {
       prof.app_ids[p->uids[i]].assign(p->uid_app_ids[i], p->uid_app_ids[i] + p->uid_app_id_lens[i]);
     }
-    LOGI("cfg:   uid %d -> package '%s' appId=%zuB", p->uids[i], pkg,
+    LOGI("teesim_cfg_add_profile:   uid %d -> package '%s' appId=%zuB", p->uids[i], pkg,
          prof.app_ids.count(p->uids[i]) ? prof.app_ids[p->uids[i]].size() : 0);
   }
   g_staging.push_back(std::move(prof));
@@ -967,9 +1071,28 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
       code != tx.begin && code != tx.update && code != tx.finish && code != tx.abort)
     return false;
   int uid = IPCThreadState::self()->getCallingUid();
-  if (!IsTarget(uid)) return false;
+  // The target test comes first, and deliberately: stamping a context costs a package lookup and
+  // two string allocations, and on a busy Android 10 device most transactions are not ours. The
+  // forward line below names its own uid, so it needs no context to be attributable.
+  if (!IsTarget(uid)) {
+    LOGD("teesim_ks_handle: %s(code=%u) from uid %d is not a target; forwarding to the real keystore",
+         TxName(code), code, uid);
+    return false;
+  }
+  // Every line logged for this transaction — here, in the handlers, and inside the TA — names the
+  // app it belongs to and the request it belongs to. Only a target reaches this point, so the
+  // package is always known.
+  const std::string pkg = PackageForUid(uid);
+  char rid[16];
+  snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+  LogContext lc_("[" + std::to_string(uid) + (pkg.empty() ? "" : " " + pkg) + " " + rid + "] ");
   Reader r(data);
-  if (!r.p.enforceInterface(kServiceDescriptor)) return false;
+  if (!r.p.enforceInterface(kServiceDescriptor)) {
+    LOGW("teesim_ks_handle: %s(code=%u) from uid %d has the wrong interface descriptor; forwarding untouched",
+         TxName(code), code,
+         uid);
+    return false;
+  }
 
   bool done = false;
   if (code == tx.del)                        done = HandleDel(uid, r.p, reply);

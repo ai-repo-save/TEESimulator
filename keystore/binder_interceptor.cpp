@@ -25,6 +25,8 @@
 #include <shared_mutex>
 #include <thread>
 
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "ks1/hook"
 #include "logging.hpp"
 #include "lsplt.hpp"
 
@@ -161,12 +163,12 @@ int intercepted_ioctl(int fd, int request, ...) {
 // Register an in-process handler for a local service binder.
 bool teesim_intercept_service(const sp<IBinder>& service, TransactionHandler handler) {
   if (!service || service->localBinder() == nullptr) {
-    LOGE("keystore: refusing to intercept a non-local binder");
+    LOGE("teesim_intercept_service: refusing to intercept a non-local binder");
     return false;
   }
   std::unique_lock lock(g_registry_mutex);
   g_registry[wp<IBinder>(service)] = std::move(handler);
-  LOGI("keystore: intercepting service binder %p", service.get());
+  LOGI("teesim_intercept_service: intercepting service binder %p", service.get());
   return true;
 }
 
@@ -184,7 +186,7 @@ bool teesim_install_binder_hook() {
     }
   }
   if (!found) {
-    LOGE("keystore: libbinder.so not found in maps");
+    LOGE("teesim_install_binder_hook: libbinder.so not found in maps");
     return false;
   }
   g_stub = sp<BinderStub>::make();

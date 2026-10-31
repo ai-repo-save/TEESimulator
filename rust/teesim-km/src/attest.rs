@@ -88,16 +88,27 @@ impl CertSignInfo {
         }
 
         let info = CertSignInfo { rsa, ec };
-        log::info!(
-            "teesim_km: keybox parsed (rsa={}, ec={})",
-            info.rsa.is_some(),
-            info.ec.is_some()
-        );
-        if let Some(a) = &info.rsa {
-            crate::resign::log_chain("teesim_km: keybox RSA chain", &a.chain);
-        }
-        if let Some(a) = &info.ec {
-            crate::resign::log_chain("teesim_km: keybox EC chain", &a.chain);
+        // Every profile builds one TA per security level from the same keybox, so the chain is
+        // described once per distinct keybox rather than once per TA.
+        static LAST_LOGGED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+        let digest = crate::resign::fnv1a(keybox_xml.as_bytes());
+        let first = LAST_LOGGED.lock().map(|mut last| std::mem::replace(&mut *last, digest) != digest);
+        if first.unwrap_or(true) {
+            log::info!(
+                "CertSignInfo::new: keybox parsed (rsa={}, ec={}) id={digest:016x}",
+                info.rsa.is_some(),
+                info.ec.is_some()
+            );
+            if let Some(a) = &info.rsa {
+                crate::resign::log_chain("keybox RSA chain", &a.chain);
+            }
+            if let Some(a) = &info.ec {
+                crate::resign::log_chain("keybox EC chain", &a.chain);
+            }
+        } else {
+            log::debug!(
+                "CertSignInfo::new: keybox parsed (id={digest:016x}, chain already logged)"
+            );
         }
         Ok(info)
     }

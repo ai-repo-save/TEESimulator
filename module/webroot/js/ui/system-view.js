@@ -277,26 +277,16 @@ function kvRow(label, val, replaced) {
   ]);
 }
 
-// A verified-boot key / hash / module hash: base64 in the record, shown as wrapping hex
-// so the raw bytes are visible. An all-zero value is flagged (it is what an unlocked
-// device reports, and worth spotting). `replaced` struck + red when it has a fabricated counterpart.
-function hexRow(rows, label, b64, replaced) {
-  const hex = b64 ? b64ToHex(b64) : null;
-  const allZero = hex != null && hex.length > 0 && /^0+$/.test(hex);
+// A verified-boot key / hash / module hash: hex in the record already, shown wrapping so the raw
+// bytes are visible. An all-zero value is flagged (it is what an unlocked device reports, and worth
+// spotting). `replaced` struck + red when it has a fabricated counterpart.
+function hexRow(rows, label, hex, replaced) {
+  const allZero = hex && /^0+$/i.test(hex);
   const flag = allZero ? el("span", { class: "chip warn small", text: "all zero" }) : null;
   rows.appendChild(el("div", { class: "kv kv-stack" + (replaced ? " kv-replaced" : "") }, [
     el("span", { class: "kv-label" }, [label, flag]),
     el("span", { class: "mono kv-hex", text: hex || "—" }),
   ]));
-}
-
-function b64ToHex(b64) {
-  try {
-    const bin = atob(b64);
-    let hex = "";
-    for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
-    return hex;
-  } catch { return null; }
 }
 
 function fmtTime(ms) {

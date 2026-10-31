@@ -178,11 +178,24 @@ const canaryInstallQuery = (args) =>
   "?tag=" + encodeURIComponent((args && args.tag) || "") +
   "&variant=" + encodeURIComponent((args && args.variant) || "release");
 
+// One RKP-only property, by its real name. The daemon re-validates the name against its known set
+// and deletes/restores it live + records or clears the delete-intent atomically (POST /rkp/delete,
+// POST /rkp/restore), so a boot/push re-enforce can never interleave with the user's action.
+const rkpNameQuery = (args) =>
+  "?name=" + encodeURIComponent((args && args.name) || "");
+
 // The save target: the chosen folder and filename, both encoded so any character is inert.
 // The log text itself rides in the request body (too large for a query), not here.
 const logsWriteQuery = (args) =>
   "?dir=" + encodeURIComponent((args && args.dir) || "") +
   "&name=" + encodeURIComponent((args && args.name) || "");
+
+// The bug-report bundle. Redaction is on unless explicitly turned off, and package names are kept
+// unless explicitly mapped — they are load-bearing for triage.
+const reportQuery = (args) =>
+  logsWriteQuery(args) +
+  ((args && args.redact === false) ? "&redact=0" : "") +
+  ((args && args.mapPackages) ? "&mapPackages=1" : "");
 
 export async function keyAdmin(action, args = {}) {
   switch (action) {
@@ -214,6 +227,19 @@ export async function keyAdmin(action, args = {}) {
       // app is discovered — there is no package observer in the daemon, so the Profiles screen's
       // pull-to-refresh is what goes and looks. Resolves to { ok, uids }.
       return request("POST", "/rescan");
+    case "rkpList":
+      // The user's RKP-only delete intents, so the view can show a Restore control for each deleted
+      // knob (a deleted prop reads back as unset, indistinguishable from never-shipped). { ok, deleted }.
+      return request("GET", "/rkp");
+    case "rkpDelete":
+      // Delete one RKP-only property live and persist the delete-intent, one daemon-owned lock-ordered
+      // step, so it cannot interleave with a boot/push re-enforce. Resolves to { ok, name, action }.
+      return request("POST", "/rkp/delete" + rkpNameQuery(args));
+    case "rkpRestore":
+      // Restore one deleted RKP-only property: set it back to the value remembered at deletion (or,
+      // when it was already unset then, just stop re-removing it) and clear the intent, atomically.
+      // Resolves to { ok, name, action }.
+      return request("POST", "/rkp/restore" + rkpNameQuery(args));
     case "keysDbDelete":
       return request("POST", "/keys/db/delete" + idsQuery(args));
     case "inspect":
@@ -224,6 +250,11 @@ export async function keyAdmin(action, args = {}) {
       return request("GET", "/logs" + logsQuery(args));
     case "logsWrite":
       return request("POST", "/logs/write" + logsWriteQuery(args), args.text);
+    case "report":
+      // The daemon assembles the zip and writes it itself — the whole rotation, the config, a
+      // property allowlist and the installed-module list, redacted on the way past. Nothing passes
+      // through this bridge but the request and the resulting path.
+      return request("POST", "/report" + reportQuery(args));
     case "keyboxInspect":
       // refresh:true has the daemon re-fetch Google's revocation list (fresh, cache-busted) before
       // re-checking — the keybox inspector's pull-to-refresh sets it.

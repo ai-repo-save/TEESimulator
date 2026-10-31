@@ -125,6 +125,15 @@ void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
                      std::string_view function_name);
 
 /**
+ * @brief Names a remote address for the "call %s" trace lines, the way find_func_addr does for
+ * every libc.so/libdl.so symbol it resolves. Used for anything called without going through
+ * find_func_addr, e.g. a target library's own entry point, found via a remote dlsym.
+ * @param addr The remote address to label.
+ * @param label The name to show for it (e.g. "entry").
+ */
+void register_symbol(uintptr_t addr, std::string label);
+
+/**
  * @brief Finds a suitable return address within a specific module in the remote
  * process.
  *

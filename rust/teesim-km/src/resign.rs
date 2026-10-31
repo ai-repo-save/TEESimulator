@@ -28,22 +28,66 @@ use x509_cert::Certificate;
 /// Local (non-TA) failure code, matching `ops::ERR_UNKNOWN`.
 const ERR: i32 = -1000;
 
-/// One-line "subject <= issuer" description of a DER certificate, for logs. Best effort.
+/// One-line description of a DER certificate, for logs. Best effort.
+///
+/// The serial and a public-key digest are here because every Android Keystore leaf carries the same
+/// `CN=Android Keystore Key` subject, so on subject and issuer alone two different keys would log
+/// identical lines. Both fields are already parsed into `tbs_certificate`, so they cost nothing.
 pub(crate) fn describe_cert(der: &[u8]) -> String {
     match Certificate::from_der(der) {
-        Ok(c) => format!(
-            "subject=[{}] issuer=[{}]",
-            c.tbs_certificate.subject, c.tbs_certificate.issuer
-        ),
+        Ok(c) => {
+            let spki = c.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+            format!(
+                "serial={} spki={} subject=[{}] issuer=[{}]",
+                short_hex(c.tbs_certificate.serial_number.as_bytes()),
+                short_hex(spki),
+                c.tbs_certificate.subject,
+                c.tbs_certificate.issuer
+            )
+        }
         Err(e) => format!("<unparseable {}-byte cert: {e}>", der.len()),
     }
 }
 
-/// Log a certificate chain at info level under `tag`, one line per cert.
+/// 64-bit FNV-1a, for naming a keybox in the log without printing any of it.
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// All of `bytes` as lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The first four bytes of `bytes` as hex, or all of it when shorter. Enough to tell two
+/// certificates apart in a log line without carrying the whole field.
+fn short_hex(bytes: &[u8]) -> String {
+    let n = bytes.len().min(4);
+    let mut out = String::with_capacity(2 * n);
+    for b in &bytes[..n] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    if bytes.len() > n {
+        out.push('~');
+    }
+    out
+}
+
+/// Log a certificate chain under `tag`, one line per cert.
+///
+/// At DEBUG, not INFO: this is the same keybox chain on every call. What varies — how many certs,
+/// and which keybox root — is on the caller's own INFO line instead. There is no level floor to skip
+/// it on, by design (see ffi.rs), so these DER parses run on every attestation; that is the accepted
+/// cost of a log file that never drops a category of content.
 pub(crate) fn log_chain(tag: &str, certs: &[kmr_wire::keymint::Certificate]) {
-    log::info!("{tag}: {} cert(s) in chain", certs.len());
+    log::debug!("log_chain: {tag}, {} cert(s)", certs.len());
     for (i, c) in certs.iter().enumerate() {
-        log::info!("{tag}:   [{i}] {}", describe_cert(&c.encoded_certificate));
+        log::debug!("log_chain: {tag} [{i}] {}", describe_cert(&c.encoded_certificate));
     }
 }
 
@@ -66,7 +110,7 @@ impl Ta {
     /// Re-sign a real hardware attestation `leaf` (DER) under the keybox with the profile's root of
     /// trust. Returns the new chain `[patched leaf, keybox chain…]`.
     pub fn patch_attestation(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
-        log::info!("teesim_km: patch_attestation input leaf: {}", describe_cert(leaf));
+        log::debug!("patch_attestation: input leaf {}", describe_cert(leaf));
         let cert = Certificate::from_der(leaf).map_err(wrap("parse real leaf"))?;
         let mut tbs = cert.tbs_certificate;
 
@@ -101,14 +145,6 @@ impl Ta {
             boot_patchlevel: self.boot_patchlevel,
             attestation_ids: self.attestation_ids.as_ref(),
         };
-        log::info!(
-            "teesim_km: patch_attestation applying profile: os_version={} os_patchlevel={} vendor_patchlevel={} boot_patchlevel={} ids={}",
-            self.os_version,
-            self.os_patchlevel,
-            self.vendor_patchlevel,
-            self.boot_patchlevel,
-            if self.attestation_ids.is_some() { "profile" } else { "device" }
-        );
         let patched = patch_key_description(ext.extn_value.as_bytes(), &overrides)?;
         ext.extn_value = OctetString::new(patched).map_err(wrap("rewrap key description"))?;
 
@@ -129,14 +165,16 @@ impl Ta {
         let mut chain = Vec::with_capacity(1 + batch_chain.len());
         chain.push(patched_leaf);
         chain.extend(batch_chain.iter().map(|c| c.encoded_certificate.clone()));
-        log::info!(
-            "teesim_km: patch_attestation -> {} cert(s) [patched leaf + keybox {} chain]",
+        // The router's INFO line reports the outcome; this names the keybox batch cert that signed
+        // it. Only the patched leaf is described: the keybox chain behind it is the one logged when
+        // the keybox was parsed.
+        log::debug!(
+            "patch_attestation: {} cert(s), leaf {} signed by keybox {} batch serial={}",
             chain.len(),
-            if is_ec { "EC" } else { "RSA" }
+            describe_cert(&chain[0]),
+            if is_ec { "EC" } else { "RSA" },
+            short_hex(batch_leaf.tbs_certificate.serial_number.as_bytes())
         );
-        for (i, c) in chain.iter().enumerate() {
-            log::info!("teesim_km:   [{i}] {}", describe_cert(c));
-        }
         Ok(chain)
     }
 

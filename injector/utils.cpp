@@ -19,6 +19,8 @@
 #include <cinttypes>
 #include <csignal>
 #include <cstdio>
+#include <map>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -26,10 +28,42 @@
 #include <string_view>
 #include <vector>
 
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "inj"
 #include "logging.hpp"
 
 // Anonymous namespace for file-local constants and helper functions.
 namespace {
+
+// Remote address -> "module!symbol", filled in by find_func_addr as each symbol is resolved, so a
+// fault inside a remote call names the function rather than a bare address. The injector is
+// single-threaded ptrace code driving one target at a time, so a plain map and a "call in flight"
+// address are all this needs.
+std::map<uintptr_t, std::string> g_resolved_symbols;
+uintptr_t g_call_in_flight = 0;
+
+// The modules whose slide has already been reported, so it is logged once per module rather than
+// once per resolved symbol.
+std::set<std::string> g_reported_modules;
+
+// The in-flight call's arguments, formatted by remote_pre_call for remote_post_call's one-line trace.
+std::string g_call_args;
+
+std::string format_call_args(const std::vector<uintptr_t> &args) {
+    std::string out;
+    char buf[24];
+    for (size_t i = 0; i < args.size(); ++i) {
+        snprintf(buf, sizeof(buf), "%s0x%" PRIxPTR, i == 0 ? "" : ", ", args[i]);
+        out += buf;
+    }
+    return out;
+}
+
+const char *symbol_at(uintptr_t addr) {
+    auto it = g_resolved_symbols.find(addr);
+    return it != g_resolved_symbols.end() ? it->second.c_str() : "?";
+}
+
 constexpr size_t kMaxPathLengthInternal = PATH_MAX; // Internal max path length.
 constexpr size_t kMsgBufferSize = 64;               // Buffer size for generic messages.
 constexpr size_t kStatusBufferSize = 128;           // Buffer size for wait status parsing.
@@ -82,6 +116,8 @@ void setup_arm_args(struct user_regs_struct &regs, const std::vector<uintptr_t> 
 #endif
 } // namespace
 
+void register_symbol(uintptr_t addr, std::string label) { g_resolved_symbols[addr] = std::move(label); }
+
 /**
  * @brief Switches the mount namespace of the current process to that of the target PID, or restores it.
  *
@@ -98,7 +134,7 @@ void setup_arm_args(struct user_regs_struct &regs, const std::vector<uintptr_t> 
 bool switch_mnt_ns(int pid, int *fd) {
     if (pid == 0) { // Restore original namespace
         if (!fd || *fd == kInvalidFd) {
-            LOGE("Invalid file descriptor for namespace switch (restore operation).");
+            LOGE("switch_mnt_ns: invalid fd for the restore");
             return false;
         }
 
@@ -106,11 +142,11 @@ bool switch_mnt_ns(int pid, int *fd) {
         *fd = kInvalidFd;   // Invalidate original pointer.
 
         if (setns(nsfd, CLONE_NEWNS) == -1) {
-            PLOGE("Failed to switch back to original namespace (FD: %d).", nsfd.operator const int &());
+            PLOGE("switch_mnt_ns: setns back to the original namespace (fd=%d)", nsfd.operator const int &());
             return false;
         }
 
-        LOGD("Successfully switched back to original namespace (FD: %d).", nsfd.operator const int &());
+        LOGD("switch_mnt_ns: restored the original namespace (fd=%d)", nsfd.operator const int &());
         return true;
     } else { // Switch to target PID's namespace
         int old_nsfd = kInvalidFd;
@@ -118,7 +154,7 @@ bool switch_mnt_ns(int pid, int *fd) {
         if (fd) { // If an FD pointer is provided, save current namespace FD.
             old_nsfd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
             if (old_nsfd == kInvalidFd) {
-                PLOGE("Failed to open current mount namespace for backup.");
+                PLOGE("switch_mnt_ns: open the current mount namespace for backup");
                 return false;
             }
             *fd = old_nsfd; // Store the original namespace FD.
@@ -127,20 +163,20 @@ bool switch_mnt_ns(int pid, int *fd) {
         std::string target_path = "/proc/" + std::to_string(pid) + "/ns/mnt";
         UniqueFd target_nsfd = open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
         if (target_nsfd == kInvalidFd) {
-            PLOGE("Failed to open target PID %d's mount namespace: %s", pid, target_path.c_str());
+            PLOGE("switch_mnt_ns: open pid=%d mount namespace %s", pid, target_path.c_str());
             if (fd)
                 *fd = kInvalidFd; // Invalidate backup FD if target fails.
             return false;
         }
 
         if (setns(target_nsfd, CLONE_NEWNS) == -1) {
-            PLOGE("Failed to switch to target PID %d's mount namespace: %s", pid, target_path.c_str());
+            PLOGE("switch_mnt_ns: setns to pid=%d mount namespace %s", pid, target_path.c_str());
             if (fd)
                 *fd = kInvalidFd; // Invalidate backup FD if target fails.
             return false;
         }
 
-        LOGD("Successfully switched to mount namespace for PID %d.", pid);
+        LOGD("switch_mnt_ns: entered the mount namespace of pid=%d", pid);
         return true;
     }
 }
@@ -160,12 +196,9 @@ bool switch_mnt_ns(int pid, int *fd) {
  */
 ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len, bool use_proc_mem) {
     if (!buf || len == 0) {
-        LOGE("Invalid parameters for write_proc: buffer is null or length is zero.");
+        LOGE("write_proc: invalid arguments (null buffer or zero length)");
         return -1;
     }
-
-    LOGV("Writing %zu bytes to PID %d at address %" PRIxPTR " (use_proc_mem=%s).", len, pid, remote_addr,
-         use_proc_mem ? "true" : "false");
 
     ssize_t bytes_written;
 
@@ -177,13 +210,13 @@ ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len, 
 
         UniqueFd proc_fd = open(proc_path, O_WRONLY | O_CLOEXEC);
         if (proc_fd == kInvalidFd) {
-            PLOGE("Failed to open %s for writing.", proc_path);
+            PLOGE("write_proc: open %s for writing", proc_path);
             return -1;
         }
 
         bytes_written = pwrite(proc_fd, buf, len, static_cast<off_t>(remote_addr));
         if (bytes_written == -1) {
-            PLOGE("pwrite failed for remote address %" PRIxPTR ".", remote_addr);
+            PLOGE("write_proc: pwrite at 0x%" PRIxPTR, remote_addr);
         }
     } else {
         // Preferred method: process_vm_writev for direct memory access.
@@ -193,12 +226,12 @@ ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len, 
 
         bytes_written = process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
         if (bytes_written == -1) {
-            PLOGE("process_vm_writev failed for remote address %" PRIxPTR ".", remote_addr);
+            PLOGE("write_proc: process_vm_writev at 0x%" PRIxPTR, remote_addr);
         }
     }
 
     if (bytes_written != -1 && static_cast<size_t>(bytes_written) != len) {
-        LOGW("Partial write: %zd bytes written, %zu expected for PID %d at %" PRIxPTR ".", bytes_written, len, pid,
+        LOGW("write_proc: partial write %zd of %zu byte(s) pid=%d at 0x%" PRIxPTR, bytes_written, len, pid,
              remote_addr);
     }
 
@@ -218,11 +251,11 @@ ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len, 
  */
 ssize_t read_proc(int pid, uintptr_t remote_addr, void *buf, size_t len) {
     if (!buf || len == 0) {
-        LOGE("Invalid parameters for read_proc: buffer is null or length is zero.");
+        LOGE("read_proc: invalid arguments (null buffer or zero length)");
         return -1;
     }
 
-    LOGV("Reading %zu bytes from PID %d at address %" PRIxPTR ".", len, pid, remote_addr);
+    LOGV("read_proc: %zu byte(s) from pid=%d at 0x%" PRIxPTR, len, pid, remote_addr);
 
     // Setup iovec structures for local and remote memory.
     struct iovec local_iov = {.iov_base = buf, .iov_len = len};
@@ -230,9 +263,9 @@ ssize_t read_proc(int pid, uintptr_t remote_addr, void *buf, size_t len) {
 
     ssize_t bytes_read = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
     if (bytes_read == -1) {
-        PLOGE("process_vm_readv failed for remote address %" PRIxPTR ".", remote_addr);
+        PLOGE("read_proc: process_vm_readv at 0x%" PRIxPTR, remote_addr);
     } else if (static_cast<size_t>(bytes_read) != len) {
-        LOGW("Partial read: %zd bytes read, %zu expected for PID %d at %" PRIxPTR ".", bytes_read, len, pid,
+        LOGW("read_proc: partial read %zd of %zu byte(s) pid=%d at 0x%" PRIxPTR, bytes_read, len, pid,
              remote_addr);
     }
 
@@ -249,23 +282,21 @@ ssize_t read_proc(int pid, uintptr_t remote_addr, void *buf, size_t len) {
  * @return True on success, false on failure.
  */
 bool get_regs(int pid, struct user_regs_struct &regs) {
-    LOGV("Retrieving registers for PID %d.", pid);
-
 #if defined(__x86_64__) || defined(__i386__)
     // For x86/x86_64, PTRACE_GETREGS is used directly with `struct
     // user_regs_struct`.
     if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) {
-        PLOGE("Failed to get registers for PID %d.", pid);
+        PLOGE("get_regs: PTRACE_GETREGS pid=%d", pid);
         return false;
     }
 #elif defined(__aarch64__) || defined(__arm__)
     // For ARM/AArch64, PTRACE_GETREGSET is used with `NT_PRSTATUS` and an iovec.
     struct iovec reg_iov = {.iov_base = &regs, .iov_len = sizeof(struct user_regs_struct)};
     if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &reg_iov) == -1) {
-        PLOGE("Failed to get register set for PID %d.", pid);
+        PLOGE("get_regs: PTRACE_GETREGSET pid=%d", pid);
 #if defined(__arm__)
         if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1) {
-            PLOGE("Fallback to PTRACE_GETREGS failed.");
+            PLOGE("get_regs: fallback PTRACE_GETREGS");
             return false;
         }
 #else
@@ -276,7 +307,6 @@ bool get_regs(int pid, struct user_regs_struct &regs) {
 #    error "Unsupported architecture for register access in get_regs."
 #endif
 
-    LOGV("Successfully retrieved registers for PID %d.", pid);
     return true;
 }
 
@@ -290,22 +320,20 @@ bool get_regs(int pid, struct user_regs_struct &regs) {
  * @return True on success, false on failure.
  */
 bool set_regs(int pid, struct user_regs_struct &regs) {
-    LOGV("Setting registers for PID %d.", pid);
-
 #if defined(__x86_64__) || defined(__i386__)
     // For x86/x86_64, PTRACE_SETREGS is used directly.
     if (ptrace(PTRACE_SETREGS, pid, 0, &regs) == -1) {
-        PLOGE("Failed to set registers for PID %d.", pid);
+        PLOGE("set_regs: PTRACE_SETREGS pid=%d", pid);
         return false;
     }
 #elif defined(__aarch64__) || defined(__arm__)
     // For ARM/AArch64, PTRACE_SETREGSET is used.
     struct iovec reg_iov = {.iov_base = &regs, .iov_len = sizeof(struct user_regs_struct)};
     if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &reg_iov) == -1) {
-        PLOGE("Failed to set register set for PID %d.", pid);
+        PLOGE("set_regs: PTRACE_SETREGSET pid=%d", pid);
 #if defined(__arm__)
         if (ptrace(PTRACE_SETREGS, pid, 0, &regs) == -1) {
-            PLOGE("Fallback to PTRACE_SETREGS failed.");
+            PLOGE("set_regs: fallback PTRACE_SETREGS");
             return false;
         }
 #else
@@ -316,7 +344,6 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
 #    error "Unsupported architecture for register access in set_regs."
 #endif
 
-    LOGV("Successfully set registers for PID %d.", pid);
     return true;
 }
 
@@ -356,14 +383,16 @@ std::string get_addr_mem_region(const std::vector<lsplt::MapInfo> &map_info, uin
 void *find_module_base(const std::vector<lsplt::MapInfo> &map_info, std::string_view module_suffix) {
     for (const auto &map : map_info) {
         // A module's base is typically its first segment with offset 0.
+        //
+        // No log line here: this runs twice (local, then remote) for every symbol resolved, and
+        // find_func_addr already reports both bases together, once per module.
         if (map.offset == 0 && map.path.ends_with(module_suffix)) {
-            LOGV("Found module base for '%.*s' at %p.", static_cast<int>(module_suffix.length()), module_suffix.data(),
-                 reinterpret_cast<void *>(map.start));
             return reinterpret_cast<void *>(map.start);
         }
     }
 
-    LOGV("Module base not found for suffix '%.*s'.", static_cast<int>(module_suffix.length()), module_suffix.data());
+    LOGD("find_module_base: no base for suffix '%.*s'", static_cast<int>(module_suffix.length()),
+         module_suffix.data());
     return nullptr;
 }
 
@@ -386,14 +415,11 @@ void *find_module_base(const std::vector<lsplt::MapInfo> &map_info, std::string_
 void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
                      const std::vector<lsplt::MapInfo> &remote_map_info, std::string_view module_name,
                      std::string_view function_name) {
-    LOGV("Resolving function '%.*s' in module '%.*s'.", static_cast<int>(function_name.length()), function_name.data(),
-         static_cast<int>(module_name.length()), module_name.data());
-
     // 1. Open the module locally to find the symbol.
     // RTLD_NOW ensures all undefined symbols are resolved immediately.
     void *lib_handle = dlopen(module_name.data(), RTLD_NOW);
     if (!lib_handle) {
-        LOGE("Failed to open local library '%.*s': %s.", static_cast<int>(module_name.length()), module_name.data(),
+        LOGE("find_func_addr: dlopen local '%.*s' failed: %s", static_cast<int>(module_name.length()), module_name.data(),
              dlerror());
         return nullptr;
     }
@@ -406,18 +432,15 @@ void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
     // 2. Find the function's address in the *local* module.
     auto *symbol_addr = reinterpret_cast<uint8_t *>(dlsym(lib_handle, function_name.data()));
     if (!symbol_addr) {
-        LOGE("Failed to find local symbol '%.*s' in library '%.*s': %s.", static_cast<int>(function_name.length()),
+        LOGE("find_func_addr: no local symbol '%.*s' in '%.*s': %s", static_cast<int>(function_name.length()),
              function_name.data(), static_cast<int>(module_name.length()), module_name.data(), dlerror());
         lib_closer(); // Ensure local handle is closed before returning.
         return nullptr;
     }
-    LOGV("Found local symbol '%.*s' at address %p.", static_cast<int>(function_name.length()), function_name.data(),
-         symbol_addr);
-
     // 3. Find the module's base address in the *local* process.
     auto *local_base = reinterpret_cast<uint8_t *>(find_module_base(local_map_info, module_name));
     if (!local_base) {
-        LOGE("Failed to find local base address for module '%.*s'.", static_cast<int>(module_name.length()),
+        LOGE("find_func_addr: no local base for '%.*s'", static_cast<int>(module_name.length()),
              module_name.data());
         lib_closer();
         return nullptr;
@@ -426,7 +449,7 @@ void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
     // 4. Find the module's base address in the *remote* process.
     auto *remote_base = reinterpret_cast<uint8_t *>(find_module_base(remote_map_info, module_name));
     if (!remote_base) {
-        LOGE("Failed to find remote base address for module '%.*s'.", static_cast<int>(module_name.length()),
+        LOGE("find_func_addr: no remote base for '%.*s'", static_cast<int>(module_name.length()),
              module_name.data());
         lib_closer();
         return nullptr;
@@ -436,8 +459,19 @@ void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
     ptrdiff_t symbol_offset = symbol_addr - local_base;
     auto *remote_symbol_addr = remote_base + symbol_offset;
 
-    LOGV("Address translation: local_base=%p, remote_base=%p, offset=%td -> remote_addr=%p", local_base, remote_base,
-         symbol_offset, remote_symbol_addr);
+    // The module's slide is the same for every symbol in it, so it is reported once — at INFO,
+    // because it is the one number that makes every remote address in this run interpretable, and it
+    // has to survive a release build for a field report to be readable at all.
+    const std::string module(module_name);
+    if (g_reported_modules.insert(module).second) {
+        LOGI("find_func_addr: module %s local=%p remote=%p slide=%+td", module.c_str(), local_base, remote_base,
+             remote_base - local_base);
+    }
+    std::string label(module);
+    label += '!';
+    label.append(function_name);
+    LOGV("find_func_addr: %s -> %p", label.c_str(), remote_symbol_addr);
+    g_resolved_symbols[reinterpret_cast<uintptr_t>(remote_symbol_addr)] = std::move(label);
 
     lib_closer(); // Close local handle.
     return remote_symbol_addr;
@@ -456,7 +490,6 @@ void *find_func_addr(const std::vector<lsplt::MapInfo> &local_map_info,
 void align_stack(struct user_regs_struct &regs, uintptr_t preserve_bytes) {
     // Decrement stack pointer by preserve_bytes, then align it down to the nearest multiple of (kStackAlignment + 1).
     regs.REG_SP = (regs.REG_SP - preserve_bytes) & ~kStackAlignment;
-    LOGV("Stack aligned to %" PRIxPTR " (preserved %zu bytes).", static_cast<uintptr_t>(regs.REG_SP), preserve_bytes);
 }
 
 /**
@@ -473,7 +506,7 @@ void align_stack(struct user_regs_struct &regs, uintptr_t preserve_bytes) {
  */
 uintptr_t push_memory(int pid, struct user_regs_struct &regs, const void *data, size_t length) {
     if (!data || length == 0) {
-        LOGE("Invalid parameters for push_memory: data=%p, length=%zu.", data, length);
+        LOGE("push_memory: invalid arguments data=%p length=%zu", data, length);
         return 0;
     }
 
@@ -489,11 +522,11 @@ uintptr_t push_memory(int pid, struct user_regs_struct &regs, const void *data, 
 
     // Write the data to the remote stack.
     if (write_proc(pid, stack_addr, data, length) != static_cast<ssize_t>(length)) {
-        LOGE("Failed to push %zu bytes to remote stack at %" PRIxPTR ".", length, stack_addr);
+        LOGE("push_memory: write %zu byte(s) at 0x%" PRIxPTR " failed", length, stack_addr);
         return 0;
     }
 
-    LOGV("Pushed %zu bytes to remote stack at %" PRIxPTR ".", length, stack_addr);
+    LOGV("push_memory: %zu byte(s) at 0x%" PRIxPTR, length, stack_addr);
     return stack_addr;
 }
 
@@ -510,7 +543,7 @@ uintptr_t push_memory(int pid, struct user_regs_struct &regs, const void *data, 
  */
 uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str) {
     if (!str) {
-        LOGE("Null string pointer passed to push_string.");
+        LOGE("push_string: null string");
         return 0;
     }
 
@@ -524,11 +557,11 @@ uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str) {
 
     // Write the string to the remote stack.
     if (write_proc(pid, stack_addr, str, str_length) != static_cast<ssize_t>(str_length)) {
-        LOGE("Failed to push string '%s' (%zu bytes) to remote stack at %" PRIxPTR ".", str, str_length, stack_addr);
+        LOGE("push_string: write '%s' (%zu byte(s)) at 0x%" PRIxPTR " failed", str, str_length, stack_addr);
         return 0;
     }
 
-    LOGV("Pushed string '%s' (%zu bytes) to remote stack at %" PRIxPTR ".", str, str_length, stack_addr);
+    LOGV("push_string: '%s' (%zu byte(s)) at 0x%" PRIxPTR, str, str_length, stack_addr);
     return stack_addr;
 }
 
@@ -555,11 +588,10 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     // Ensure stack is aligned before modifying it for function arguments.
     align_stack(regs);
 
-    LOGV("Setting up remote function call to %p (func_addr=%" PRIxPTR ") with %zu arguments. Return to %p.",
-         reinterpret_cast<void *>(func_addr), func_addr, args.size(), reinterpret_cast<void *>(return_addr));
-    for (size_t i = 0; i < args.size(); i++) {
-        LOGV("  arg[%zu] = %p (%" PRIuPTR ")", i, reinterpret_cast<void *>(args[i]), args[i]);
-    }
+    // Remembered for remote_post_call, which logs the whole call as one line once its result is
+    // known, named through the symbol map ("libc.so!recvmsg") rather than as a bare address.
+    g_call_in_flight = func_addr;
+    g_call_args = format_call_args(args);
 
 #if defined(__x86_64__)
     // x86_64 Calling Convention (System V AMD64 ABI):
@@ -578,7 +610,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
         // Write stack arguments from `args.data() + kMaxRegisterArgs` (the elements beyond registers).
         if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + kMaxRegisterArgs, stack_args_size) !=
             static_cast<ssize_t>(stack_args_size)) {
-            LOGE("Failed to push stack arguments for x86_64 remote call.");
+            LOGE("remote_pre_call: push stack arguments (x86_64) failed");
             return false;
         }
     }
@@ -587,7 +619,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     regs.REG_SP -= sizeof(uintptr_t);
     if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), &return_addr, sizeof(return_addr)) !=
         sizeof(return_addr)) {
-        LOGE("Failed to write return address for x86_64 remote call.");
+        LOGE("remote_pre_call: write return address (x86_64) failed");
         return false;
     }
 
@@ -608,7 +640,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
         // This matches the ABI memory layout without needing to reverse the vector.
         if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data(), stack_args_size) !=
             static_cast<ssize_t>(stack_args_size)) {
-            LOGE("Failed to push arguments for i386 remote call.");
+            LOGE("remote_pre_call: push arguments (i386) failed");
             return false;
         }
     }
@@ -617,7 +649,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
     regs.REG_SP -= sizeof(uintptr_t);
     if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), &return_addr, sizeof(return_addr)) !=
         sizeof(return_addr)) {
-        LOGE("Failed to write return address for i386 remote call.");
+        LOGE("remote_pre_call: write return address (i386) failed");
         return false;
     }
 
@@ -637,7 +669,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
 
         if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + kMaxRegisterArgs, stack_args_size) !=
             static_cast<ssize_t>(stack_args_size)) {
-            LOGE("Failed to push stack arguments for AArch64 remote call.");
+            LOGE("remote_pre_call: push stack arguments (AArch64) failed");
             return false;
         }
     }
@@ -658,7 +690,7 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
 
         if (write_proc(pid, static_cast<uintptr_t>(regs.REG_SP), args.data() + 4, stack_args_size) !=
             static_cast<ssize_t>(stack_args_size)) {
-            LOGE("Failed to push stack arguments for ARM remote call.");
+            LOGE("remote_pre_call: push stack arguments (ARM) failed");
             return false;
         }
     }
@@ -683,17 +715,16 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
 
     // Set the modified registers in the target process.
     if (!set_regs(pid, regs)) {
-        LOGE("Failed to set registers for remote function call in PID %d.", pid);
+        LOGE("remote_pre_call: set registers pid=%d failed", pid);
         return false;
     }
 
     // Continue the target process execution.
     if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
-        PLOGE("Failed to continue remote process %d execution.", pid);
+        PLOGE("remote_pre_call: PTRACE_CONT pid=%d", pid);
         return false;
     }
 
-    LOGV("Remote function call initiated successfully for PID %d to %p.", pid, reinterpret_cast<void *>(func_addr));
     return true;
 }
 
@@ -711,48 +742,53 @@ bool remote_pre_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr
  * @return The return value of the remote function (from REG_RET), or 0 on error.
  */
 uintptr_t remote_post_call(int pid, struct user_regs_struct &regs, uintptr_t expected_return_addr) {
-    LOGV("Waiting for remote function call completion in PID %d.", pid);
+    const char *what = symbol_at(g_call_in_flight);
 
     int status;
     // Wait for the target process to stop.
     if (!wait_for_trace(pid, &status, __WALL)) {
-        LOGE("Failed to wait for remote function completion in PID %d.", pid);
+        LOGE("remote_post_call: %s pid=%d: wait for completion failed", what, pid);
         return 0;
     }
 
     // Retrieve the registers after the call.
     if (!get_regs(pid, regs)) {
-        LOGE("Failed to get registers after remote call completion in PID %d.", pid);
+        LOGE("remote_post_call: %s pid=%d: get registers after completion failed", what, pid);
         return 0;
     }
 
+    // A successful remote call stops with SIGSEGV at the deliberately invalid return address: that
+    // is the mechanism, not a fault, so only a stop anywhere else is reported.
     int stop_signal = WSTOPSIG(status);
-    LOGV("Remote function in PID %d stopped with signal: %s(%d) at address %p.", pid, sigabbrev_np(stop_signal),
-         stop_signal, reinterpret_cast<void *>(regs.REG_IP));
 
     // Check if the process stopped at the expected return address.
     // SIGTRAP is often received if a breakpoint was set at return_addr, or if single-stepping.
     // A SIGSEGV here indicates a crash during the remote function execution.
     if (static_cast<uintptr_t>(regs.REG_IP) != expected_return_addr) {
-        // Log unexpected return, potentially indicating a crash or unexpected flow.
-        LOGE("Remote function in PID %d returned to unexpected address %p (expected %p).", pid,
-             reinterpret_cast<void *>(regs.REG_IP), reinterpret_cast<void *>(expected_return_addr));
+        // The call faulted somewhere inside itself. Name the function, and say which mapping the
+        // instruction pointer landed in.
+        LOGE("remote_post_call: %s pid=%d faulted: returned to %p in [%s], expected %p, signal %s(%d)", what, pid,
+             reinterpret_cast<void *>(regs.REG_IP),
+             get_addr_mem_region(lsplt::MapInfo::Scan(std::to_string(pid)),
+                                 static_cast<uintptr_t>(regs.REG_IP))
+                 .c_str(),
+             reinterpret_cast<void *>(expected_return_addr), sigabbrev_np(stop_signal), stop_signal);
 
         // Attempt to get more detailed crash info if it was a SIGSEGV or similar.
         if (stop_signal == SIGSEGV || stop_signal == SIGBUS || stop_signal == SIGILL) {
             siginfo_t crash_info;
             if (ptrace(PTRACE_GETSIGINFO, pid, 0, &crash_info) == 0) {
-                LOGE("Crash details for PID %d: si_code=%d si_addr=%p.", pid, crash_info.si_code, crash_info.si_addr);
+                LOGE("remote_post_call: %s pid=%d si_code=%d si_addr=%p", what, pid, crash_info.si_code,
+                     crash_info.si_addr);
             } else {
-                PLOGE("Failed to get crash signal info for PID %d.", pid);
+                PLOGE("remote_post_call: %s pid=%d PTRACE_GETSIGINFO", what, pid);
             }
         }
         return 0; // Indicate failure.
     }
 
     uintptr_t return_value = regs.REG_RET; // Extract the return value from the appropriate register.
-    LOGV("Remote function in PID %d completed with return value: %p (%" PRIxPTR ").", pid,
-         reinterpret_cast<void *>(return_value), return_value);
+    LOGV("remote_call: %s(%s) -> %p", what, g_call_args.c_str(), reinterpret_cast<void *>(return_value));
     return return_value;
 }
 
@@ -772,7 +808,7 @@ uintptr_t remote_post_call(int pid, struct user_regs_struct &regs, uintptr_t exp
 uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr, uintptr_t return_addr,
                       std::vector<uintptr_t> &args) {
     if (!remote_pre_call(pid, regs, func_addr, return_addr, args)) {
-        LOGE("Failed to prepare remote function call in PID %d.", pid);
+        LOGE("remote_call: %s pid=%d: prepare failed", symbol_at(func_addr), pid);
         return 0;
     }
     return remote_post_call(pid, regs, return_addr);
@@ -793,7 +829,7 @@ int fork_dont_care() {
     // First fork: Parent returns, child continues to fork again.
     int first_pid = fork();
     if (first_pid < 0) {
-        PLOGE("Failed first fork for daemon process.");
+        PLOGE("fork_dont_care: first fork");
         return first_pid;
     }
 
@@ -801,7 +837,7 @@ int fork_dont_care() {
         // Second fork: First child exits, grand-child becomes daemon.
         int second_pid = fork();
         if (second_pid < 0) {
-            PLOGE("Failed second fork for daemon process.");
+            PLOGE("fork_dont_care: second fork");
             exit(EXIT_FAILURE); // Grand-child creation failed, exit first child.
         } else if (second_pid > 0) {
             exit(EXIT_SUCCESS); // First child exits.
@@ -830,7 +866,7 @@ int fork_dont_care() {
  */
 bool wait_for_trace(int pid, int *status, int flags) {
     if (!status) {
-        LOGE("Null status pointer passed to wait_for_trace.");
+        LOGE("wait_for_trace: null status pointer");
         return false;
     }
 
@@ -838,21 +874,22 @@ bool wait_for_trace(int pid, int *status, int flags) {
         pid_t result = waitpid(pid, status, flags);
         if (result == -1) {
             if (errno == EINTR) {
-                LOGV("waitpid for PID %d interrupted, retrying.", pid);
+                LOGV("wait_for_trace: waitpid pid=%d interrupted, retrying", pid);
                 continue; // Retry on EINTR.
             } else {
-                PLOGE("waitpid failed for PID %d.", pid);
+                PLOGE("wait_for_trace: waitpid pid=%d", pid);
                 return false;
             }
         }
 
         // If waitpid returns a valid PID, check if the process actually stopped.
         if (!WIFSTOPPED(*status)) {
-            LOGE("Process %d not stopped for trace: %s.", pid, parse_status(*status).c_str());
+            LOGE("wait_for_trace: pid=%d not stopped for trace: %s", pid, parse_status(*status).c_str());
             return false;
         }
 
-        LOGV("Process %d stopped for trace with status: %s.", pid, parse_status(*status).c_str());
+        // No line for a successful stop: every remote call ends in one, and each caller reports the
+        // stop it did not expect.
         return true;
     }
 }
@@ -896,7 +933,7 @@ std::string get_program(int pid) {
 
     ssize_t link_size = readlink(exe_path.c_str(), resolved_path, kMaxPathLengthInternal);
     if (link_size == -1) {
-        PLOGE("Failed to read executable path for PID %d: %s", pid, exe_path.c_str());
+        PLOGE("get_program: readlink pid=%d %s", pid, exe_path.c_str());
         return "";
     }
 
@@ -921,13 +958,11 @@ void *find_module_return_addr(const std::vector<lsplt::MapInfo> &map_info, std::
         // Look for a readable, non-executable segment of the module.
         // This is a common heuristic for finding a safe return address for ptrace.
         if (!(map.perms & PROT_EXEC) && (map.perms & PROT_READ) && map.path.ends_with(module_suffix)) {
-            LOGV("Found return address region for '%.*s' at %p.", static_cast<int>(module_suffix.length()),
-                 module_suffix.data(), reinterpret_cast<void *>(map.start));
             return reinterpret_cast<void *>(map.start);
         }
     }
 
-    LOGV("No suitable return address region found for module suffix '%.*s'.", static_cast<int>(module_suffix.length()),
+    LOGV("find_module_return_addr: no region for suffix '%.*s'", static_cast<int>(module_suffix.length()),
          module_suffix.data());
     return nullptr;
 }
@@ -942,7 +977,7 @@ void *find_module_return_addr(const std::vector<lsplt::MapInfo> &map_info, std::
  */
 std::string generateMagic(size_t length) {
     if (length == 0) {
-        LOGW("Zero length requested for magic string, returning empty string.");
+        LOGW("generateMagic: zero length requested; returning an empty string");
         return "";
     }
 
@@ -958,7 +993,6 @@ std::string generateMagic(size_t length) {
         magic_string += kRandomChars[char_distribution(random_generator)];
     }
 
-    LOGV("Generated magic string of length %zu.", length);
     return magic_string;
 }
 
@@ -974,7 +1008,7 @@ std::string generateMagic(size_t length) {
  */
 int setfilecon(const char *file_path, const char *security_context) {
     if (!file_path || !security_context) {
-        LOGE("Invalid parameters for setfilecon: file_path=%p, security_context=%p.", file_path, security_context);
+        LOGE("setfilecon: invalid arguments file_path=%p security_context=%p", file_path, security_context);
         return -1;
     }
 
@@ -984,9 +1018,9 @@ int setfilecon(const char *file_path, const char *security_context) {
     int result = syscall(__NR_setxattr, file_path, XATTR_NAME_SELINUX, security_context, context_len, 0);
 
     if (result == 0) {
-        LOGV("Successfully set SELinux context '%s' for file '%s'.", security_context, file_path);
+        LOGV("setfilecon: '%s' on '%s'", security_context, file_path);
     } else {
-        PLOGE("Failed to set SELinux context '%s' for file '%s'.", security_context, file_path);
+        PLOGE("setfilecon: set '%s' on '%s'", security_context, file_path);
     }
 
     return result;
@@ -1003,7 +1037,7 @@ int setfilecon(const char *file_path, const char *security_context) {
  */
 bool set_sockcreate_con(const char *security_context) {
     if (!security_context) {
-        LOGE("Null security context passed to set_sockcreate_con.");
+        LOGE("set_sockcreate_con: null security context");
         return false;
     }
 
@@ -1013,12 +1047,11 @@ bool set_sockcreate_con(const char *security_context) {
     UniqueFd sockcreate_fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC);
     if (sockcreate_fd != kInvalidFd &&
         write(sockcreate_fd, security_context, context_size) == static_cast<ssize_t>(context_size)) {
-        LOGV("Successfully set socket creation context via /proc/thread-self/attr/sockcreate: '%s'.", security_context);
+        LOGV("set_sockcreate_con: '%s' via /proc/thread-self/attr/sockcreate", security_context);
         return true;
     }
 
-    LOGV("Failed to set socket creation context via /proc/thread-self/attr/sockcreate,"
-         " attempting process-specific fallback.");
+    LOGV("set_sockcreate_con: /proc/thread-self/attr/sockcreate failed; trying the per-process path");
 
     // Fallback: Try a process-specific path (might be less effective or deprecated depending on kernel).
     char process_path[kMaxPathLengthInternal];
@@ -1028,10 +1061,10 @@ bool set_sockcreate_con(const char *security_context) {
     sockcreate_fd = open(process_path, O_WRONLY | O_CLOEXEC);
     if (sockcreate_fd == kInvalidFd ||
         write(sockcreate_fd, security_context, context_size) != static_cast<ssize_t>(context_size)) {
-        PLOGE("Failed to set socket creation context via fallback path '%s'.", process_path);
+        PLOGE("set_sockcreate_con: write fallback path '%s'", process_path);
         return false;
     }
 
-    LOGV("Successfully set socket creation context via fallback path '%s': '%s'.", process_path, security_context);
+    LOGV("set_sockcreate_con: via '%s': '%s'", process_path, security_context);
     return true;
 }

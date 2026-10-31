@@ -10,27 +10,33 @@
 
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
-#include <android/binder_ibinder.h>  // AIBinder_getCallingUid
+#include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
+#include <unistd.h>                       // getuid / getpid
 
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <condition_variable>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "control.h"
+#include "keymint_hook.h"
+#include "km_names.h"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "km"
 #include "logging.hpp"
 #include "teesim_km.h"
 
 using namespace aidl::android::hardware::security::keymint;
 namespace secureclock = aidl::android::hardware::security::secureclock;
-
-// Set by the router around calls into the real HAL so the interceptor lets those
-// transactions through instead of looping back to us. Defined in keymint_hook.cpp.
-extern "C" void teesim_hook_set_forwarding(bool forwarding);
 
 namespace {
 
@@ -66,6 +72,9 @@ struct Profile {
   TaPtr ta_strongbox;
   std::vector<TargetPackage> packages;
   std::vector<int32_t> uids;  // resolved caller uids, for requests that carry no app-id to match
+  // Parallel to uids[]: the package the daemon resolved each uid from, or "" for a raw uid:N or an
+  // auto-included one. Only used to name the caller in the log — routing never reads it.
+  std::vector<std::string> uid_names;
   bool patch_mode = false;
 
   // The TA that serves requests arriving at `level`. Software-level KeyMint is never wrapped, so any
@@ -78,6 +87,9 @@ struct Profile {
 // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mu.
 std::mutex g_cfg_mu;
 std::vector<Profile> g_profiles;
+// Signalled by teesim_cfg_commit. Operations on one of our own key blobs wait on this rather than
+// failing while the daemon has not pushed a config yet; see WaitForDefaultTa.
+std::condition_variable g_cfg_cv;
 bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
 // The device-wide MODULE_HASH to seed a freshly built TA with, so a generation-mode key carries the
 // tag keystore2 only sends once per boot (and never resends to a TA built afterwards). Preference:
@@ -95,7 +107,7 @@ bool g_stage_locked = true;
 int32_t g_stage_vb_state = 0;
 bool g_stage_strongbox_ok = false;
 int32_t g_stage_attest_version_tee = 400;
-int32_t g_stage_attest_version_strongbox = 400;
+int32_t g_stage_attest_version_strongbox = 300;
 
 // --- Per-caller usage stats --------------------------------------------------
 // Every app that asks us for a key this boot is recorded here from generateKey,
@@ -121,6 +133,33 @@ uint64_t NowBootMs() {
   return static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
 }
 
+// Milliseconds on CLOCK_MONOTONIC, for the "how long did this take" fields. Deliberately not
+// NowBootMs: the usage stats need a clock that keeps counting across suspend, a duration needs one
+// that does not.
+uint64_t NowMonoMs() {
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
+}
+
+// A stopwatch for one span, so the log can say whether a hooked call added latency even below the
+// ~500ms threshold where libbinder's own slow-transaction warning fires.
+struct Elapsed {
+  uint64_t t0 = NowMonoMs();
+  unsigned long long Ms() const { return NowMonoMs() - t0; }
+};
+
+// The security level as the name a reader knows it by, rather than the AIDL's ordinal.
+const char* LevelName(SecurityLevel level) {
+  switch (level) {
+    case SecurityLevel::SOFTWARE: return "SW";
+    case SecurityLevel::TRUSTED_ENVIRONMENT: return "TEE";
+    case SecurityLevel::STRONGBOX: return "StrongBox";
+    case SecurityLevel::KEYSTORE: return "keystore";
+    default: return "?";
+  }
+}
+
 // Record one key request from `caller_uid` (target or not). Cheap by design: the
 // daemon does the uid->package resolution, so we only bump the count and stamp
 // the time. A caller with no valid uid (-1) is skipped.
@@ -143,6 +182,9 @@ struct ForwardGuard {
 struct RequestTarget {
   TaPtr ta;
   bool patch_mode = false;
+  // The profile's id, for the log: on a device with more than one profile it says which keybox
+  // signed a chain.
+  std::string id;
 };
 
 RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t caller_uid,
@@ -165,11 +207,15 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
       for (const auto& pkg : prof.packages) {
         if (hay.find(pkg.name) == std::string::npos) continue;
         if (caller_user >= 0 && pkg.user_id != caller_user) {
-          LOGI("route: '%s' matches profile '%s' but for user %d, not the caller's user %d — skipped",
+          // A seam, not an outcome: it fires per candidate package on every request that carries an
+          // attestation application id, and says nothing a reader wants unless routing is the thing
+          // under investigation.
+          LOGD("ProfileForRequest: '%s' matches profile '%s' for user %d, not the caller's user "
+               "%d; skipped",
                pkg.name.c_str(), prof.id.c_str(), pkg.user_id, caller_user);
           continue;
         }
-        return {prof.TaFor(level), prof.patch_mode};
+        return {prof.TaFor(level), prof.patch_mode, prof.id};
       }
     }
   }
@@ -179,20 +225,107 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
   if (caller_uid != static_cast<uid_t>(-1)) {
     for (const auto& prof : g_profiles) {
       for (int32_t uid : prof.uids) {
-        if (static_cast<uid_t>(uid) == caller_uid) return {prof.TaFor(level), prof.patch_mode};
+        if (static_cast<uid_t>(uid) == caller_uid) return {prof.TaFor(level), prof.patch_mode, prof.id};
       }
     }
   }
   return {};
 }
 
+// The log prefix naming the request a hooked call is serving: "[10316 com.snapchat.android r3c81] ",
+// or "[10316 r3c81] " when no configured package resolved to that uid. Stamped once per entry point;
+// every line the call logs then carries it, which is what makes an operation attributable to an app
+// instead of having to be inferred from what was logged next to it on an interleaved thread.
+//
+// AIBinder_getCallingUid returns getuid() when no transaction is in flight, never -1, so a uid alone
+// cannot tell keystore2's own work (its key garbage collection, say) from an app running as
+// AID_KEYSTORE. Pairing the uid with the pid says which it is.
+std::string PackageNameFor(int32_t uid) {
+  std::lock_guard<std::mutex> lk(g_cfg_mu);
+  for (const auto& prof : g_profiles) {
+    for (size_t i = 0; i < prof.uids.size(); ++i) {
+      if (prof.uids[i] != uid) continue;
+      if (i < prof.uid_names.size()) return prof.uid_names[i];
+      return std::string();
+    }
+  }
+  // No exact match: a secondary-user caller carries uid = user * 100000 + app_id and shares its
+  // package with the primary-user entry of the same app id, so match on app id to name it rather
+  // than log a bare uid (a Private-space app forwards here as e.g. 1010156 for app id 10156). The
+  // name carries the user as "pkg@<user>" to mark it a cross-user instance, not a configured
+  // target. Log line only; routing keys off the exact uid, so it never widens a profile's scope.
+  const int32_t app_id = uid % 100000;
+  for (const auto& prof : g_profiles) {
+    for (size_t i = 0; i < prof.uids.size() && i < prof.uid_names.size(); ++i) {
+      if (prof.uids[i] % 100000 == app_id && !prof.uid_names[i].empty()) {
+        return prof.uid_names[i] + "@" + std::to_string(uid / 100000);
+      }
+    }
+  }
+  return std::string();
+}
+
+// A fresh context for the request now entering. `rid` joins this request's lines across the router,
+// the TA and both languages; it is minted here because this is the one place every hooked call
+// passes through.
+std::string RequestCtx() {
+  char rid[16];
+  snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+  const uid_t caller_uid = AIBinder_getCallingUid();
+  // AIBinder_getCallingPid is __INTRODUCED_IN(29), the same floor as getCallingUid — unlike
+  // AIBinder_isHandlingTransaction, which is 33 and would be a null weak symbol on Android 12.
+  if (caller_uid == getuid() && AIBinder_getCallingPid() == getpid()) {
+    return std::string("[self ") + rid + "] ";
+  }
+  const int32_t uid = static_cast<int32_t>(caller_uid);
+  std::string tag = "[" + std::to_string(uid);
+  const std::string name = PackageNameFor(uid);
+  if (!name.empty()) tag += " " + name;
+  return tag + " " + rid + "] ";
+}
+
+// How long an operation on one of our own key blobs waits for the daemon's first config push.
+constexpr auto kConfigWait = std::chrono::seconds(8);
+
+// ErrorCode::HARDWARE_NOT_YET_AVAILABLE. Returned when a key of ours outlives the wait below: it says
+// "come back later", where the UNIMPLEMENTED we used to return says "this key is unusable" and pushes
+// the app into deleting and regenerating it.
+constexpr int32_t kNotYetAvailable = -85;
+
 // The TA used for operations on an existing blob of ours (begin/upgrade/etc.), at the level the op
 // arrived on. Any profile's TA can decrypt any of our blobs (the KEK is level- and profile-
 // independent), but the level must match so the reference TA finds the key's characteristics at its
 // own level; the front profile's instance for `level` serves as that default.
-TaPtr DefaultTaFor(SecurityLevel level) {
-  std::lock_guard<std::mutex> lk(g_cfg_mu);
-  if (g_profiles.empty()) return {};
+//
+// It waits out the window between this library taking over keystore2's KeyMint and the daemon
+// pushing the config that builds those TAs. keystore2 resolves KeyMint — and apps start using their
+// keys — within a second of boot, while the daemon still has to harvest and validate before it can
+// push. A key of OURS touched in that window has no TA to serve it, and the hard error we used to
+// return reads to keystore2 (and to the app) as "this key is broken": the app's recovery is to delete
+// the alias and generate a fresh key, which silently destroys everything the old key had encrypted.
+// Blocking the caller for a moment instead costs a stall at boot and keeps the key.
+TaPtr WaitForDefaultTa(SecurityLevel level) {
+  // Latched once the wait has run out, so a daemon that never pushes (no keybox, say) costs one
+  // stall rather than one per call: every app touching a key of ours would otherwise park a
+  // keystore2 binder thread for the full timeout and could starve the pool at boot.
+  static bool gave_up = false;
+  std::unique_lock<std::mutex> lk(g_cfg_mu);
+  if (g_profiles.empty()) {
+    if (gave_up) return {};
+    LOGW("WaitForDefaultTa: no profile configured yet; holding an operation on one of our keys for up "
+         "to %llds rather than failing it",
+         static_cast<long long>(kConfigWait.count()));
+    g_cfg_cv.wait_for(lk, kConfigWait, [] { return !g_profiles.empty(); });
+    if (g_profiles.empty()) {
+      gave_up = true;
+      LOGE("WaitForDefaultTa: still no profile after waiting; the daemon never pushed a config (missing "
+           "or invalid keybox?); reporting the hardware as not yet available, and an app that gives "
+           "up here may regenerate its key and lose whatever it had encrypted");
+      return {};
+    }
+    LOGI("WaitForDefaultTa: config arrived while waiting; serving the operation");
+  }
+  gave_up = false;
   return g_profiles.front().TaFor(level);
 }
 
@@ -221,7 +354,7 @@ void SeedModuleHash(const TaPtr& ta, const std::vector<uint8_t>& hash) {
   p.blob = hash.data();
   p.blob_len = hash.size();
   int32_t rc = teesim_km_set_additional_attestation_info(ta.get(), &p, 1);
-  if (rc != 0) LOGW("SeedModuleHash: TA rejected (%d)", rc);
+  if (rc != 0) LOGW("SeedModuleHash: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
 }
 
 // --- AIDL KeyParameter <-> flat KmParam --------------------------------------
@@ -350,6 +483,43 @@ ndk::ScopedAStatus Status(int32_t code) {
                    : ndk::ScopedAStatus::fromServiceSpecificError(code);
 }
 
+// A forwarded call's outcome, in the form the log wants it: the KeyMint status by number and by
+// name. A transaction that died before reaching the HAL carries no service-specific error at all — its
+// getServiceSpecificError() is 0, which reads as success — so that case is reported as the binder
+// exception it actually is.
+std::string StatusDesc(const ndk::ScopedAStatus& st) {
+  if (st.isOk()) return "rc=0";
+  char buf[96];
+  if (st.getExceptionCode() == EX_SERVICE_SPECIFIC) {
+    const int32_t rc = st.getServiceSpecificError();
+    snprintf(buf, sizeof(buf), "rc=%d(%s)", rc, teesim_km_err_name(rc));
+  } else {
+    snprintf(buf, sizeof(buf), "binder_exc=%d transaction=%d", st.getExceptionCode(),
+             st.getStatus());
+  }
+  return std::string(buf);
+}
+
+// A call we can neither serve nor forward. UNIMPLEMENTED is what the caller sees; saying so is what
+// distinguishes "the module declined" from "the module was never asked".
+ndk::ScopedAStatus NoRealHal(const char* what) {
+  LOGW("%s: FAILED, not ours to serve and no real HAL to forward to; reporting rc=-100(%s)", what,
+       teesim_km_err_name(-100));
+  return Status(-100);
+}
+
+// The reply to an operation on one of our keys that arrives with no TA to serve it.
+//
+// WaitForDefaultTa latches `gave_up` after its first timeout, so on a device where the daemon never
+// pushes a config this is not one stall but the permanent answer for every operation on every key of
+// ours. An app that concludes its key is broken may regenerate it, so every occurrence is logged.
+ndk::ScopedAStatus NoTa(const char* what) {
+  LOGW("%s: FAILED, no TA for this level yet; reporting rc=%d(%s); an app that gives up here may "
+       "regenerate its key and lose whatever it had encrypted",
+       what, kNotYetAvailable, teesim_km_err_name(kNotYetAvailable));
+  return Status(kNotYetAvailable);
+}
+
 void FillCreationResult(TsCreationResult* res, KeyCreationResult* out) {
   const uint8_t* blob = nullptr;
   size_t blob_len = 0;
@@ -385,6 +555,22 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
   return teesim_km_is_marked(blob.data(), blob.size());
 }
 
+// True when the request creates an asymmetric key (RSA or EC) — the only algorithms KeyMint
+// attests, and the only kind worth simulating. A symmetric key (AES/3DES/HMAC) is never attested,
+// so simulating one would move the app's key off the real hardware for no gain, and an auth-bound
+// one would then verify against a TA holding no device HMAC key. Those are forwarded to the real
+// HAL, exactly as the keystore1 path does (#291). A request with no algorithm tag cannot be one of
+// ours, so it forwards too.
+bool IsAsymmetricKeyRequest(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::ALGORITHM && p.value.getTag() == KeyParameterValue::algorithm) {
+      const Algorithm a = p.value.get<KeyParameterValue::algorithm>();
+      return a == Algorithm::RSA || a == Algorithm::EC;
+    }
+  }
+  return false;
+}
+
 // True if the request creates a key with ATTEST_KEY purpose (an attestation key). Such a key MUST be
 // minted in the TA (generation), never patched: only if we hold its private key can our TA later sign
 // — and root-of-trust-patch — the leaves this key attests. A patched real-hardware attest key can only
@@ -395,6 +581,17 @@ bool IsAttestKeyRequest(const std::vector<KeyParameter>& params) {
         p.value.get<KeyParameterValue::keyPurpose>() == KeyPurpose::ATTEST_KEY) {
       return true;
     }
+  }
+  return false;
+}
+
+// True if the request asks for attestation, i.e. carries an ATTESTATION_CHALLENGE. That tag decides
+// what the real HAL owes us: an attestation certificate with it, and without it a single certificate
+// that carries no attestation extension at all, which is what KeyCreationResult requires. There is
+// nothing to re-root in the latter, so patch mode keeps that key rather than falling to generation.
+bool HasAttestationChallenge(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::ATTESTATION_CHALLENGE) return true;
   }
   return false;
 }
@@ -427,35 +624,145 @@ const TsTimestampToken* FlattenTimestamp(const std::optional<secureclock::TimeSt
   return storage;
 }
 
+// --- Operation tracing -------------------------------------------------------
+//
+// A capture that records only blob_len cannot answer the question these failures
+// pose: whether a decrypt that fails its tag is being asked to decrypt ciphertext
+// that belongs to a different key, or whether the operation itself was mishandled.
+// Length is not identity -- two keys of the same size are indistinguishable, and a
+// blob that changed under an upgrade keeps its length. So tag every blob, and
+// record what an AEAD verdict actually depends on: the nonce, the tag length, and
+// the byte counts on the way through.
+
+// 64-bit FNV-1a over the blob, printed as 16 hex digits. A digest, not the bytes:
+// enough to say "the same blob as before" or "a different one", and no key material
+// reaches the log.
+std::string BlobTag(const std::vector<uint8_t>& blob) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint8_t b : blob) {
+    h ^= b;
+    h *= 0x100000001b3ULL;
+  }
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+  return std::string(buf);
+}
+
+std::string HexOf(const std::vector<uint8_t>& v) {
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  out.reserve(v.size() * 2);
+  for (uint8_t b : v) {
+    out.push_back(kHex[b >> 4]);
+    out.push_back(kHex[b & 0xf]);
+  }
+  return out;
+}
+
+// The begin parameters an AEAD or RSA verdict turns on. A wrong nonce and stale
+// ciphertext both surface as VERIFICATION_FAILED, and nothing in the old capture
+// told them apart.
+// The shape of a key being created: algorithm, size or curve, and purposes, by name. The parameter
+// count alone cannot tell an attested EC signing key from an AES key an app keeps a secret under.
+std::string KeyShape(const std::vector<KeyParameter>& params) {
+  std::string algorithm = "?", size, curve, purposes;
+  for (const auto& p : params) {
+    if (p.tag == Tag::ALGORITHM && p.value.getTag() == KeyParameterValue::algorithm) {
+      algorithm = toString(p.value.get<KeyParameterValue::algorithm>());
+    } else if (p.tag == Tag::KEY_SIZE && p.value.getTag() == KeyParameterValue::integer) {
+      size = std::to_string(p.value.get<KeyParameterValue::integer>());
+    } else if (p.tag == Tag::EC_CURVE && p.value.getTag() == KeyParameterValue::ecCurve) {
+      curve = toString(p.value.get<KeyParameterValue::ecCurve>());
+    } else if (p.tag == Tag::PURPOSE && p.value.getTag() == KeyParameterValue::keyPurpose) {
+      if (!purposes.empty()) purposes += "|";
+      purposes += toString(p.value.get<KeyParameterValue::keyPurpose>());
+    }
+  }
+  std::string out = algorithm;
+  if (!curve.empty()) {
+    out += "/" + curve;
+  } else if (!size.empty()) {
+    out += "-" + size;
+  }
+  return out + " purpose=" + (purposes.empty() ? "-" : purposes);
+}
+
+// The full parameter list of a request, decoded (see KmDescribeParams).
+std::string ParamsDesc(const std::vector<KeyParameter>& params) {
+  const auto km = ToKmVec(params);
+  return KmDescribeParams(km.data(), km.size());
+}
+
+// A short id naming ONE operation, not the key it runs on. Two concurrent operations on the same
+// blob are otherwise indistinguishable, which is exactly the case a failing AEAD tag poses: the
+// question is whether this decrypt was handed the nonce belonging to its own ciphertext, and with
+// only op[<blob>] to go on, the begin that carried that nonce cannot be identified. Our own
+// operations print the TA's real handle, so a line here and a line from the TA name the same thing;
+// a forwarded one has no handle we can see, so it gets a process-local serial.
+std::string OpId(int64_t op_handle) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "h%llx", static_cast<unsigned long long>(op_handle));
+  return std::string(buf);
+}
+
+std::string NextForwardedOpId() {
+  static std::atomic<uint32_t> next{0};
+  char buf[16];
+  snprintf(buf, sizeof(buf), "f%x", next.fetch_add(1, std::memory_order_relaxed));
+  return std::string(buf);
+}
+
 // --- IKeyMintOperation -------------------------------------------------------
 
 class TeesimKeyMintOperation : public BnKeyMintOperation {
  public:
-  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle)
-      : ta_(std::move(ta)), op_handle_(op_handle) {}
+  // `ctx` is the caller tag captured at begin(): keystore2 drives update/finish/abort on whatever
+  // binder thread the app's later calls land on, and getCallingUid there is the app's, but an
+  // operation outliving its begin is exactly where an anonymous line would leave us guessing. Carry
+  // it with the operation instead of re-deriving it.
+  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle, std::string blob_tag, std::string ctx)
+      : ta_(std::move(ta)),
+        op_handle_(op_handle),
+        op_id_(OpId(op_handle)),
+        blob_tag_(std::move(blob_tag)),
+        ctx_(std::move(ctx)) {}
   ~TeesimKeyMintOperation() override {
-    if (!finished_) teesim_km_abort(ta_.get(), op_handle_);
+    LogContext lc_(ctx_);
+    // An operation destroyed without a finish or an abort is keystore2 dropping it — a pruned
+    // operation slot, or an app that went away mid-decrypt. Logged so the operation's end is
+    // visible, as its forwarded twin's abort is.
+    if (!finished_) {
+      int32_t rc = teesim_km_abort(ta_.get(), op_handle_);
+      LOGD("op[%s/%s] ours dropped without finish: abandoned by keystore2, aborted in the TA rc=%d(%s)",
+           blob_tag_.c_str(), op_id_.c_str(), rc, teesim_km_err_name(rc));
+    }
   }
 
   ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
                                const std::optional<HardwareAuthToken>& authToken,
                                const std::optional<secureclock::TimeStampToken>& tst) override {
+    LogContext lc_(ctx_);
     TsAuthToken at;
     TsTimestampToken tt;
-    return Status(teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size(),
-                                       FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt)));
+    int32_t rc = teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size(),
+                                      FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt));
+    LogOp("ours update_aad", rc, "aad=%zu", input.size());
+    return Status(rc);
   }
 
   ndk::ScopedAStatus update(const std::vector<uint8_t>& input,
                             const std::optional<HardwareAuthToken>& authToken,
                             const std::optional<secureclock::TimeStampToken>& tst,
                             std::vector<uint8_t>* out) override {
+    LogContext lc_(ctx_);
     TsAuthToken at;
     TsTimestampToken tt;
     uint8_t* buf = nullptr;
     size_t len = 0;
     int32_t rc = teesim_km_update(ta_.get(), op_handle_, input.data(), input.size(),
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), &buf, &len);
+    in_total_ += input.size();
+    LogOp("ours update", rc, "in=%zu out=%zu in_total=%zu", input.size(), len, in_total_);
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
@@ -468,6 +775,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
                             const std::optional<secureclock::TimeStampToken>& tst,
                             const std::optional<std::vector<uint8_t>>& confirmationToken,
                             std::vector<uint8_t>* out) override {
+    LogContext lc_(ctx_);
     const uint8_t* in_ptr = input ? input->data() : nullptr;
     size_t in_len = input ? input->size() : 0;
     const uint8_t* sig_ptr = signature ? signature->data() : nullptr;
@@ -482,6 +790,11 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), conf_ptr,
                                   conf_len, &buf, &len);
     finished_ = true;
+    // in_total is what the tag check actually consumed: for GCM the reference TA
+    // holds the trailing tag back from update() and verifies it here, so a finish
+    // with no input is normal and the interesting number is everything before it.
+    LogOp("ours finish", rc, "in=%zu sig=%zu in_total=%zu out=%zu", in_len, sig_len,
+          in_total_ + in_len, len);
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
@@ -489,14 +802,127 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
   }
 
   ndk::ScopedAStatus abort() override {
+    LogContext lc_(ctx_);
     finished_ = true;
-    return Status(teesim_km_abort(ta_.get(), op_handle_));
+    int32_t rc = teesim_km_abort(ta_.get(), op_handle_);
+    LogOp("ours abort", rc, "in_total=%zu", in_total_);
+    return Status(rc);
   }
 
  private:
+  // One line per call, at the level the outcome earns: a non-zero rc is a failure the app sees, so it
+  // logs at WARN while successes stay at DEBUG. The error is named rather than left as a bare number.
+  __attribute__((format(printf, 4, 5)))
+  void LogOp(const char* what, int32_t rc, const char* fmt, ...) {
+    char detail[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, ap);
+    va_end(ap);
+    if (rc == 0) {
+      LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
+    } else {
+      LOGW("op[%s/%s] %s FAILED: rc=%d(%s) %s", blob_tag_.c_str(), op_id_.c_str(), what, rc,
+           teesim_km_err_name(rc), detail);
+    }
+  }
+
   TaPtr ta_;
   int64_t op_handle_;
+  std::string op_id_;
+  std::string blob_tag_;
+  std::string ctx_;
+  size_t in_total_ = 0;
   bool finished_ = false;
+};
+
+// --- IKeyMintOperation, forwarded --------------------------------------------
+//
+// A forwarded begin used to hand keystore2 the real HAL's operation object, after
+// which update/finish went straight there and nothing about them was observable
+// here. That is precisely the case that needs watching -- a non-target app whose
+// decrypt fails its tag in the real TA -- so wrap the operation and delegate. Every
+// call is passed through untouched; only the counts are recorded.
+class ForwardedKeyMintOperation : public BnKeyMintOperation {
+ public:
+  ForwardedKeyMintOperation(std::shared_ptr<IKeyMintOperation> real, std::string blob_tag,
+                            std::string op_id, std::string ctx)
+      : real_(std::move(real)),
+        blob_tag_(std::move(blob_tag)),
+        op_id_(std::move(op_id)),
+        ctx_(std::move(ctx)) {}
+
+  ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
+                               const std::optional<HardwareAuthToken>& authToken,
+                               const std::optional<secureclock::TimeStampToken>& tst) override {
+    LogContext lc_(ctx_);
+    ForwardGuard g;
+    auto st = real_->updateAad(input, authToken, tst);
+    LogOp("real update_aad", st, "aad=%zu", input.size());
+    return st;
+  }
+
+  ndk::ScopedAStatus update(const std::vector<uint8_t>& input,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            const std::optional<secureclock::TimeStampToken>& tst,
+                            std::vector<uint8_t>* out) override {
+    LogContext lc_(ctx_);
+    ForwardGuard g;
+    auto st = real_->update(input, authToken, tst, out);
+    in_total_ += input.size();
+    LogOp("real update", st, "in=%zu out=%zu in_total=%zu", input.size(),
+          out ? out->size() : 0, in_total_);
+    return st;
+  }
+
+  ndk::ScopedAStatus finish(const std::optional<std::vector<uint8_t>>& input,
+                            const std::optional<std::vector<uint8_t>>& signature,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            const std::optional<secureclock::TimeStampToken>& tst,
+                            const std::optional<std::vector<uint8_t>>& confirmationToken,
+                            std::vector<uint8_t>* out) override {
+    LogContext lc_(ctx_);
+    ForwardGuard g;
+    auto st = real_->finish(input, signature, authToken, tst, confirmationToken, out);
+    const size_t in_len = input ? input->size() : 0;
+    // from=real-hal is the fact that decides whether a failure here is ours: the module forwarded
+    // the call untouched and the real hardware is what rejected it.
+    LogOp("real finish", st, "in=%zu sig=%zu in_total=%zu out=%zu from=real-hal", in_len,
+          signature ? signature->size() : 0, in_total_ + in_len, out ? out->size() : 0);
+    return st;
+  }
+
+  ndk::ScopedAStatus abort() override {
+    LogContext lc_(ctx_);
+    ForwardGuard g;
+    auto st = real_->abort();
+    LogOp("real abort", st, "in_total=%zu", in_total_);
+    return st;
+  }
+
+ private:
+  // The forwarded twin of TeesimKeyMintOperation::LogOp: a real-hardware rejection logs at WARN with
+  // its status named, so it never reads like a success.
+  __attribute__((format(printf, 4, 5)))
+  void LogOp(const char* what, const ndk::ScopedAStatus& st, const char* fmt, ...) {
+    char detail[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, ap);
+    va_end(ap);
+    if (st.isOk()) {
+      LOGD("op[%s/%s] %s: %s rc=0", blob_tag_.c_str(), op_id_.c_str(), what, detail);
+    } else {
+      LOGW("op[%s/%s] %s FAILED: %s %s", blob_tag_.c_str(), op_id_.c_str(), what,
+           StatusDesc(st).c_str(), detail);
+    }
+  }
+
+  std::shared_ptr<IKeyMintOperation> real_;
+  std::string blob_tag_;
+  std::string op_id_;
+  std::string ctx_;
+  size_t in_total_ = 0;
 };
 
 // --- IKeyMintDevice ----------------------------------------------------------
@@ -507,6 +933,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       : level_(level), real_(std::move(real)) {}
 
   ndk::ScopedAStatus getHardwareInfo(KeyMintHardwareInfo* info) override {
+    LogContext lc_(RequestCtx());
     if (real_) {
       ForwardGuard g;
       return real_->getHardwareInfo(info);
@@ -522,20 +949,78 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   ndk::ScopedAStatus generateKey(const std::vector<KeyParameter>& keyParams,
                                  const std::optional<AttestationKey>& attestationKey,
                                  KeyCreationResult* out) override {
+    LogContext lc_(RequestCtx());
     const uid_t caller_uid = AIBinder_getCallingUid();
     RecordUsage(static_cast<int32_t>(caller_uid));  // every app that asks for a key, for the daemon's usage view
     RequestTarget t = ProfileForRequest(keyParams, caller_uid, level_);
-    LOGI("generateKey: level=%d, %zu param(s), caller_uid=%d, caller_attest_key=%d, target=%d, "
-         "patch_mode=%d, strongbox_ok=%d",
-         static_cast<int>(level_), keyParams.size(), static_cast<int>(caller_uid),
-         attestationKey.has_value(), t.ta != nullptr, t.patch_mode, g_strongbox_ok);
+    TsRkpVerdict rkp{};
+    teesim_hook_take_rkp_verdict(&rkp);
+    // A verdict recorded more than this long ago cannot belong to the request in hand: keystore2
+    // resolves the attest key immediately before calling generateKey on the same thread. An older
+    // one was armed for a request it then abandoned, and reporting it here would attribute another
+    // app's gate decision to this key.
+    constexpr uint32_t kRkpFreshMs = 2000;
+    const bool rkp_none = std::strcmp(rkp.verdict, "none") == 0;
+    const bool rkp_stale = !rkp_none && rkp.age_ms > kRkpFreshMs;
+    // "none" has no uid, no rid and no age to report, and it is the common case — most requests
+    // never reach the gate at all. Printing three placeholder fields for it would put noise on
+    // every line to say nothing happened.
+    char rkp_gate[96];
+    if (rkp_none) {
+      snprintf(rkp_gate, sizeof(rkp_gate), "none");
+    } else {
+      snprintf(rkp_gate, sizeof(rkp_gate), "%s(uid=%d,r%04x,%ums%s)", rkp.verdict, rkp.uid, rkp.rid,
+               rkp.age_ms, rkp_stale ? ",STALE" : "");
+    }
+    // Only a target app's own call earns INFO: every OTHER app on the device calling generateKey
+    // (the overwhelming majority of calls this router ever sees) is not our concern, and at INFO its
+    // parameters would drown the target-app lines this exists for.
+    if (t.ta) {
+      LOGI("generateKey: level=%s, profile=%s, %s, caller_attest_key=%d, patch_mode=%d, "
+           "strongbox_ok=%d, rkp_gate=%s",
+           LevelName(level_), t.id.empty() ? "-" : t.id.c_str(), KeyShape(keyParams).c_str(),
+           attestationKey.has_value(), t.patch_mode, g_strongbox_ok, rkp_gate);
+      LOGI("generateKey: params=%s", ParamsDesc(keyParams).c_str());
+    } else {
+      LOGD("generateKey: level=%s, %s, caller_attest_key=%d, not a target, rkp_gate=%s",
+           LevelName(level_), KeyShape(keyParams).c_str(), attestationKey.has_value(), rkp_gate);
+      LOGD("generateKey: params=%s", ParamsDesc(keyParams).c_str());
+    }
+    // An attest key decides everything that follows — a foreign one can only ever be forwarded, and
+    // the leaf it signs keeps the real root of trust — so name it here, next to the gate verdict that
+    // let it through. "rkp_gate=none" with an attest key present means keystore2 obtained it without
+    // ever calling the getRegistration we hook: the key came from somewhere our gate cannot see.
+    if (attestationKey) {
+      const bool ours = IsOurs(attestationKey->keyBlob);
+      LOGI("generateKey: attest key=%s, blob_len=%zu, ours=%d, issuer_len=%zu (%s)",
+           BlobTag(attestationKey->keyBlob).c_str(), attestationKey->keyBlob.size(), ours,
+           attestationKey->issuerSubjectName.size(),
+           ours ? "ours: its leaves stay keybox-rooted"
+                : "foreign: we hold no private half, so this leaf keeps the REAL root of trust");
+    }
     if (!t.ta) {
       if (real_) {
-        LOGI("generateKey: forwarding to real HAL (not a target)");
+        LOGD("generateKey: forwarding to real HAL (not a target)");
         ForwardGuard g;
-        return real_->generateKey(keyParams, attestationKey, out);
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk()) LOGW("generateKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
       }
-      return Status(-100);
+      return NoRealHal(__func__);
+    }
+    // A target's symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest). An attest
+    // key is always asymmetric, so this never diverts one.
+    if (!IsAsymmetricKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("generateKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
+             "real TEE)");
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
+        return st;
+      }
+      return NoRealHal(__func__);
     }
     // Creating an ATTESTATION KEY (ATTEST_KEY purpose) always mints it in the TA (ours). Unless the
     // caller named one of our keys as its attest key (the "ours" case just below), we ignore any
@@ -580,18 +1065,21 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         // No real HAL to forward to (a device built without one). We cannot mint under a foreign
         // attest key ourselves, so fail rather than dereference a null proxy.
         LOGW("generateKey: foreign attest key but no real HAL; failing");
-        return Status(-100);
+        return NoRealHal(__func__);
       }
       ForwardGuard g;
-      return real_->generateKey(keyParams, attestationKey, out);
+      auto st = real_->generateKey(keyParams, attestationKey, out);
+      if (!st.isOk()) {
+        LOGW("generateKey: FAILED in the real HAL under a foreign attest key: %s",
+             StatusDesc(st).c_str());
+      }
+      return st;
     }
     // No attest key. Patch mode re-roots the real hardware leaf under the keybox; a StrongBox that cannot
     // attest (g_strongbox_ok=false), or no real HAL, generates instead.
     if (t.patch_mode && real_ && (level_ != SecurityLevel::STRONGBOX || g_strongbox_ok)) {
-      LOGI("generateKey: patch mode (re-signing real hardware attestation) for target app");
       return PatchAttest(t.ta.get(), keyParams, out);
     }
-    LOGI("generateKey: generation mode for target app");
     return Simulate(t.ta.get(), keyParams, attestationKey, out);
   }
 
@@ -599,23 +1087,57 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                const std::vector<uint8_t>& keyData,
                                const std::optional<AttestationKey>& attestationKey,
                                KeyCreationResult* out) override {
+    LogContext lc_(RequestCtx());
     RequestTarget t = ProfileForRequest(keyParams, AIBinder_getCallingUid(), level_);
     TaPtr ta = t.ta;
+    // importKey creates a key exactly as generateKey does, so it is logged the same way: only a
+    // target's own call earns INFO; every other app importing a key of its own is not our concern.
+    if (ta) {
+      LOGI("importKey: level=%s, profile=%s, %s, format=%s, key_data_len=%zu, "
+           "caller_attest_key=%d, patch_mode=%d",
+           LevelName(level_), t.id.empty() ? "-" : t.id.c_str(), KeyShape(keyParams).c_str(),
+           toString(keyFormat).c_str(), keyData.size(), attestationKey.has_value(),
+           t.patch_mode);
+      LOGI("importKey: params=%s", ParamsDesc(keyParams).c_str());
+    } else {
+      LOGD("importKey: level=%s, %s, format=%s, key_data_len=%zu, not a target",
+           LevelName(level_), KeyShape(keyParams).c_str(), toString(keyFormat).c_str(),
+           keyData.size());
+      LOGD("importKey: params=%s", ParamsDesc(keyParams).c_str());
+    }
     if (!ta) {
       if (real_) {
+        LOGD("importKey: forwarding to real HAL (not a target)");
         ForwardGuard g;
-        return real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk()) LOGW("importKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
       }
-      return Status(-100);
+      return NoRealHal(__func__);
+    }
+    // As in generateKey, a symmetric key is forwarded rather than simulated.
+    if (!IsAsymmetricKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("importKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
+             "real TEE)");
+        ForwardGuard g;
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk())
+          LOGW("importKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
+        return st;
+      }
+      return NoRealHal(__func__);
     }
     // As in generateKey: a foreign attest key can't be used by our TA — forward instead.
     if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
       if (real_) {
         LOGI("importKey: attest key is not ours; forwarding to real HAL");
         ForwardGuard g;
-        return real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk()) LOGW("importKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
       }
-      return Status(-100);
+      return NoRealHal(__func__);
     }
     auto km = ToKmVec(keyParams);
     auto ak = MakeAttestKey(attestationKey);
@@ -624,9 +1146,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                       static_cast<int32_t>(keyFormat), keyData.data(), keyData.size(),
                                       ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
                                       ak.issuer, ak.issuer_len, &res);
-    if (rc != 0) return Status(rc);
+    if (rc != 0) {
+      LOGW("importKey: FAILED in the TA: rc=%d(%s)", rc, teesim_km_err_name(rc));
+      return Status(rc);
+    }
     FillCreationResult(res, out);
     teesim_km_free_result(res);
+    LOGI("importKey: emitted %zu-cert chain (imported into the TA) key=%s blob_len=%zu",
+         out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size());
     return ndk::ScopedAStatus::ok();
   }
 
@@ -634,24 +1161,45 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                            const std::vector<KeyParameter>& params,
                            const std::optional<HardwareAuthToken>& authToken,
                            BeginResult* out) override {
-    LOGI("begin: purpose=%d, blob_len=%zu, ours=%d", static_cast<int>(purpose), keyBlob.size(),
-         IsOurs(keyBlob));
+    LogContext lc_(RequestCtx());
+    const std::string blob_tag = BlobTag(keyBlob);
+    // One line per begin, written once the outcome is known: it names the operation every later
+    // line of it carries. A failure carries the same description.
+    const std::string what = "purpose=" + toString(purpose) + ", key=" + blob_tag +
+                             ", blob_len=" + std::to_string(keyBlob.size()) +
+                             ", params=" + ParamsDesc(params);
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
-        return real_->begin(purpose, keyBlob, params, authToken, out);
+        auto st = real_->begin(purpose, keyBlob, params, authToken, out);
+        if (!st.isOk()) {
+          LOGW("begin: FAILED in the real HAL: %s; %s", StatusDesc(st).c_str(), what.c_str());
+          return st;
+        }
+        if (out->operation) {
+          // The id is minted here and printed on both this line and every later line of the
+          // operation, so a finish that fails names the begin that carried its nonce.
+          std::string op_id = NextForwardedOpId();
+          LOGD("begin: %s -> real HAL op[%s/%s]", what.c_str(), blob_tag.c_str(), op_id.c_str());
+          out->operation = ndk::SharedRefBase::make<ForwardedKeyMintOperation>(
+              out->operation, blob_tag, std::move(op_id), teesim_log_context());
+        }
+        return st;
       }
-      return Status(-100);
+      return NoRealHal(__func__);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return NoTa(__func__);
     auto km = ToKmVec(params);
     TsAuthToken at;
     TsBeginResult* res = nullptr;
     int32_t rc = teesim_km_begin(ta.get(), static_cast<int32_t>(purpose), keyBlob.data(),
                                  keyBlob.size(), km.data(), km.size(), FlattenAuth(authToken, &at),
                                  &res);
-    if (rc != 0) return Status(rc);
+    if (rc != 0) {
+      LOGW("begin: FAILED in the TA: rc=%d(%s); %s", rc, teesim_km_err_name(rc), what.c_str());
+      return Status(rc);
+    }
     out->challenge = teesim_km_begin_challenge(res);
     size_t n = teesim_km_begin_num_params(res);
     out->params.reserve(n);
@@ -662,12 +1210,22 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     int64_t op_handle = teesim_km_begin_op_handle(res);
     teesim_km_free_begin(res);
-    out->operation = ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle);
+    LOGD("begin: %s -> TA op[%s/%s]", what.c_str(), blob_tag.c_str(), OpId(op_handle).c_str());
+    out->operation =
+        ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle, blob_tag,
+                                                        teesim_log_context());
     return ndk::ScopedAStatus::ok();
   }
 
   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
-    LOGI("deleteKey: blob_len=%zu, ours=%d", keyBlob.size(), IsOurs(keyBlob));
+    LogContext lc_(RequestCtx());
+    // keystore2 garbage-collects superseded real blobs on its own thread; only a delete of one of
+    // our keys is an event worth INFO.
+    if (IsOurs(keyBlob)) {
+      LOGI("deleteKey: key=%s, blob_len=%zu, ours=1", BlobTag(keyBlob).c_str(), keyBlob.size());
+    } else {
+      LOGD("deleteKey: key=%s, blob_len=%zu, ours=0", BlobTag(keyBlob).c_str(), keyBlob.size());
+    }
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
@@ -675,31 +1233,47 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return ndk::ScopedAStatus::ok();
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return ndk::ScopedAStatus::ok();
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return NoTa(__func__);
     return Status(teesim_km_delete_key(ta.get(), keyBlob.data(), keyBlob.size()));
   }
 
   ndk::ScopedAStatus upgradeKey(const std::vector<uint8_t>& keyBlobToUpgrade,
                                 const std::vector<KeyParameter>& upgradeParams,
                                 std::vector<uint8_t>* out) override {
-    LOGI("upgradeKey: blob_len=%zu, ours=%d", keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade));
+    LogContext lc_(RequestCtx());
+    // An upgrade is the one operation that legitimately replaces a blob, so it is
+    // the one place a key can quietly stop being the key that encrypted an app's
+    // data. Log what went in and what came back out.
+    LOGI("upgradeKey: key=%s, blob_len=%zu, ours=%d, params=%s", BlobTag(keyBlobToUpgrade).c_str(),
+         keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade), ParamsDesc(upgradeParams).c_str());
     if (!IsOurs(keyBlobToUpgrade)) {
       if (real_) {
         ForwardGuard g;
-        return real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        auto st = real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        if (!st.isOk()) {
+          LOGW("upgradeKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
+          return st;
+        }
+        LOGI("upgradeKey: real HAL returned key=%s, blob_len=%zu",
+             out ? BlobTag(*out).c_str() : "-", out ? out->size() : 0);
+        return st;
       }
-      return Status(-100);
+      return NoRealHal(__func__);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return NoTa(__func__);
     auto km = ToKmVec(upgradeParams);
     uint8_t* buf = nullptr;
     size_t len = 0;
     int32_t rc = teesim_km_upgrade_key(ta.get(), keyBlobToUpgrade.data(), keyBlobToUpgrade.size(),
                                        km.data(), km.size(), &buf, &len);
-    if (rc != 0) return Status(rc);
+    if (rc != 0) {
+      LOGW("upgradeKey: FAILED in the TA: rc=%d(%s)", rc, teesim_km_err_name(rc));
+      return Status(rc);
+    }
     out->assign(buf, buf + len);
+    LOGI("upgradeKey: TA returned key=%s, blob_len=%zu", BlobTag(*out).c_str(), out->size());
     teesim_km_free_buf(buf, len);
     return ndk::ScopedAStatus::ok();
   }
@@ -708,16 +1282,18 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                            const std::vector<uint8_t>& appId,
                                            const std::vector<uint8_t>& appData,
                                            std::vector<KeyCharacteristics>* out) override {
-    LOGI("getKeyCharacteristics: blob_len=%zu, ours=%d", keyBlob.size(), IsOurs(keyBlob));
+    LogContext lc_(RequestCtx());
+    LOGD("getKeyCharacteristics: key=%s, blob_len=%zu, ours=%d", BlobTag(keyBlob).c_str(),
+         keyBlob.size(), IsOurs(keyBlob));
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
         return real_->getKeyCharacteristics(keyBlob, appId, appData, out);
       }
-      return Status(-100);
+      return NoRealHal(__func__);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return NoTa(__func__);
     TsCharacteristics* res = nullptr;
     int32_t rc = teesim_km_get_key_characteristics(ta.get(), keyBlob.data(), keyBlob.size(),
                                                    appId.data(), appId.size(), appData.data(),
@@ -742,12 +1318,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 
   ndk::ScopedAStatus convertStorageKeyToEphemeral(const std::vector<uint8_t>& storageKeyBlob,
                                                   std::vector<uint8_t>* out) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out) : Status(-100);
+    return real_ ? real_->convertStorageKeyToEphemeral(storageKeyBlob, out) : NoRealHal(__func__);
   }
 
   // Everything below is not simulated; forward to the real HAL when present.
   ndk::ScopedAStatus addRngEntropy(const std::vector<uint8_t>& data) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     return real_ ? real_->addRngEntropy(data) : ndk::ScopedAStatus::ok();
   }
@@ -761,16 +1339,19 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                       const std::vector<KeyParameter>& unwrappingParams,
                                       int64_t passwordSid, int64_t biometricSid,
                                       KeyCreationResult* out) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     return real_ ? real_->importWrappedKey(wrappedKeyData, wrappingKeyBlob, maskingKey,
                                            unwrappingParams, passwordSid, biometricSid, out)
-                 : Status(-100);
+                 : NoRealHal(__func__);
   }
   ndk::ScopedAStatus deleteAllKeys() override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     return real_ ? real_->deleteAllKeys() : ndk::ScopedAStatus::ok();
   }
   ndk::ScopedAStatus destroyAttestationIds() override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     return real_ ? real_->destroyAttestationIds() : ndk::ScopedAStatus::ok();
   }
@@ -781,6 +1362,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // its own (real hardware) keys.
   ndk::ScopedAStatus deviceLocked(bool passwordOnly,
                                   const std::optional<secureclock::TimeStampToken>& tst) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     // deviceLocked is deprecated in the AIDL but still part of the interface we implement, so we
     // relay it verbatim; suppress the deprecation warning for the one forwarding call.
@@ -790,25 +1372,29 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
 #pragma clang diagnostic pop
   }
   ndk::ScopedAStatus earlyBootEnded() override {
+    LogContext lc_(RequestCtx());
     // Latch end-of-early-boot on our keys too, so an EARLY_BOOT_ONLY key we minted stops working at
     // the same point keystore2 signals the real HAL. Best-effort: a TA that rejects is only logged.
     for (const auto& ta : AllProfileTas()) {
       int32_t rc = teesim_km_early_boot_ended(ta.get());
-      if (rc != 0) LOGW("earlyBootEnded: TA rejected (%d)", rc);
+      if (rc != 0) LOGW("earlyBootEnded: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
     ForwardGuard g;
     return real_ ? real_->earlyBootEnded() : ndk::ScopedAStatus::ok();
   }
   ndk::ScopedAStatus getRootOfTrustChallenge(std::array<uint8_t, 16>* out) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->getRootOfTrustChallenge(out) : Status(-100);
+    return real_ ? real_->getRootOfTrustChallenge(out) : NoRealHal(__func__);
   }
   ndk::ScopedAStatus getRootOfTrust(const std::array<uint8_t, 16>& challenge,
                                     std::vector<uint8_t>* out) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
-    return real_ ? real_->getRootOfTrust(challenge, out) : Status(-100);
+    return real_ ? real_->getRootOfTrust(challenge, out) : NoRealHal(__func__);
   }
   ndk::ScopedAStatus sendRootOfTrust(const std::vector<uint8_t>& rootOfTrust) override {
+    LogContext lc_(RequestCtx());
     ForwardGuard g;
     return real_ ? real_->sendRootOfTrust(rootOfTrust) : ndk::ScopedAStatus::ok();
   }
@@ -816,6 +1402,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // key we attest carries the same value keystore2 pushes to the real HAL and still matches a genuine
   // device. Applied to every profile since the info is device-wide; best-effort per TA.
   ndk::ScopedAStatus setAdditionalAttestationInfo(const std::vector<KeyParameter>& info) override {
+    LogContext lc_(RequestCtx());
     // Latch keystore2's MODULE_HASH as the authoritative value to seed TAs built later this boot: it
     // is the exact bytes the real HAL got, so it matches a genuine device byte-for-byte.
     for (const auto& p : info) {
@@ -827,7 +1414,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(info);
     for (const auto& ta : AllProfileTas()) {
       int32_t rc = teesim_km_set_additional_attestation_info(ta.get(), km.data(), km.size());
-      if (rc != 0) LOGW("setAdditionalAttestationInfo: TA rejected (%d)", rc);
+      if (rc != 0)
+        LOGW("setAdditionalAttestationInfo: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
     ForwardGuard g;
     return real_ ? real_->setAdditionalAttestationInfo(info) : ndk::ScopedAStatus::ok();
@@ -857,10 +1445,11 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // Patch mode: the real hardware generates and attests the key; we keep its genuine, hardware-backed
   // key blob and re-sign only the attestation chain under the keybox, with the root of trust patched
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
-  // HAL. Falls back to generation if the real HAL declines or returns no attestation to re-sign.
+  // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
                                  KeyCreationResult* out) {
     KeyCreationResult real;
+    Elapsed real_el;
     {
       ForwardGuard g;
       // No attest key here — a request that carries one is handled before we reach patch mode (ours is
@@ -868,21 +1457,49 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       // batch key; we keep only the leaf and re-sign it under the keybox.
       auto st = real_->generateKey(keyParams, std::nullopt, &real);
       if (!st.isOk()) {
-        LOGW("patch: real generateKey failed (%d); generating instead", st.getServiceSpecificError());
+        LOGW("PatchAttest: real generateKey failed (%s) after %llums; generating instead",
+             StatusDesc(st).c_str(), real_el.Ms());
         return Simulate(ta, keyParams, std::nullopt, out);
       }
     }
-    if (real.certificateChain.empty()) {
-      LOGW("patch: real attestation returned no certificates; generating instead");
-      return Simulate(ta, keyParams, std::nullopt, out);
+    const unsigned long long real_ms = real_el.Ms();
+    if (real.certificateChain.empty() || !HasAttestationChallenge(keyParams)) {
+      // Nothing to attest — not a failure, and KeyCreationResult spells out both shapes. A symmetric
+      // key (AES/HMAC/3DES) never has a certificate, so an empty chain is the real HAL saying it. A key
+      // requested without an ATTESTATION_CHALLENGE comes back as a single certificate with no
+      // attestation extension — self-signed when the key can sign, empty-signatured when it cannot —
+      // which says the same. Keep the hardware key exactly as it came back: minting
+      // our own would move the app's key material into the software TA for no gain in attestation, and
+      // an auth-bound key would then be checked against a TA that holds no device HMAC key ("no device
+      // HMAC key; accepting auth_token on presence"), which is how fingerprint-bound keys start failing
+      // with KEY_USER_NOT_AUTHENTICATED. Both are read before the move, not after it.
+      //
+      // certs= is here to keep this path honest. Taking the request's word for it means we no longer
+      // look inside the leaf, so a HAL that attested without being asked would have its real,
+      // unpatched chain handed to the app with nothing said. That cannot happen within the contract
+      // and has never been seen — every such request in the logs behind this change returned exactly
+      // one certificate — so it earns a logged number rather than a branch: any count but 1 here is a
+      // HAL breaking its side, and worth finding in a report instead of shipping for a release.
+      const char* nothing = real.certificateChain.empty() ? "real HAL returned no certificates"
+                                                          : "no attestation challenge in the request";
+      const size_t n_certs = real.certificateChain.size();
+      *out = std::move(real);
+      LOGI("PatchAttest: %s (nothing to attest); keeping the real key key=%s blob_len=%zu certs=%zu "
+           "real=%llums",
+           nothing, BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), n_certs, real_ms);
+      return ndk::ScopedAStatus::ok();
     }
-    LOGI("patch: real HAL returned %zu cert(s); re-signing only the leaf under the keybox",
-         real.certificateChain.size());
+    LOGD("PatchAttest: real HAL returned %zu cert(s) in %llums; re-signing only the leaf under the "
+         "keybox",
+         real.certificateChain.size(), real_ms);
     const auto& leaf = real.certificateChain.front().encodedCertificate;
     TsCreationResult* res = nullptr;
+    Elapsed ta_el;
     int32_t rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
+    const unsigned long long ta_ms = ta_el.Ms();
     if (rc != 0) {
-      LOGW("patch: re-signing the real attestation failed (%d); generating instead", rc);
+      LOGW("PatchAttest: re-signing the real attestation failed rc=%d(%s); generating instead", rc,
+           teesim_km_err_name(rc));
       return Simulate(ta, keyParams, std::nullopt, out);
     }
     // Keep the real hardware key blob and characteristics; swap in the keybox-rooted, RoT-patched
@@ -898,8 +1515,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       out->certificateChain[i].encodedCertificate.assign(c, c + clen);
     }
     teesim_km_free_result(res);
-    LOGI("patch: emitted %zu-cert chain (real key blob kept, leaf re-rooted at keybox)",
-         out->certificateChain.size());
+    // The key tag ties this creation to every later begin, upgrade and delete on the key, so a blob
+    // seen at a begin can be traced back to the profile that signed it and whether it was patched or
+    // minted.
+    LOGI("PatchAttest: emitted %zu-cert chain (real key blob kept, leaf re-rooted at keybox) key=%s "
+         "blob_len=%zu real=%llums ta=%llums",
+         out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), real_ms,
+         ta_ms);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -909,14 +1531,20 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     auto km = ToKmVec(keyParams);
     auto ak = MakeAttestKey(attestationKey);
     TsCreationResult* res = nullptr;
+    Elapsed ta_el;
     int32_t rc = teesim_km_generate_key(ta, km.data(), km.size(),
                                         ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
                                         ak.issuer, ak.issuer_len, &res);
-    if (rc != 0) return Status(rc);
+    const unsigned long long ta_ms = ta_el.Ms();
+    if (rc != 0) {
+      LOGW("Simulate: FAILED in the TA: rc=%d(%s)", rc, teesim_km_err_name(rc));
+      return Status(rc);
+    }
     FillCreationResult(res, out);
     teesim_km_free_result(res);
-    LOGI("generate: emitted %zu-cert chain (whole key minted in the TA)",
-         out->certificateChain.size());
+    LOGI("Simulate: emitted %zu-cert chain (whole key minted in the TA) key=%s blob_len=%zu "
+         "ta=%llums",
+         out->certificateChain.size(), BlobTag(out->keyBlob).c_str(), out->keyBlob.size(), ta_ms);
     return ndk::ScopedAStatus::ok();
   }
 
@@ -993,7 +1621,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   ::Ta* ta_tee = buildTa(static_cast<int32_t>(SecurityLevel::TRUSTED_ENVIRONMENT));
   ::Ta* ta_sb = buildTa(static_cast<int32_t>(SecurityLevel::STRONGBOX));
   if (!ta_tee || !ta_sb) {
-    LOGE("keymint: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
+    LOGE("teesim_cfg_add_profile: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
     if (ta_tee) teesim_km_destroy(ta_tee);
     if (ta_sb) teesim_km_destroy(ta_sb);
     return false;
@@ -1021,22 +1649,36 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     // No package_users[] at all means an older daemon that only ever targeted the primary user.
     prof.packages.push_back({p->packages[i], p->package_users ? p->package_users[i] : 0});
   }
-  for (int i = 0; i < p->n_uids && p->uids; ++i) prof.uids.push_back(p->uids[i]);
-  LOGI("cfg: staged profile '%s' (mode=%s, security_level=%d, %zu package(s), %zu uid(s))",
-       prof.id.c_str(), prof.patch_mode ? "patch" : "generation", p->security_level,
+  for (int i = 0; i < p->n_uids && p->uids; ++i) {
+    prof.uids.push_back(p->uids[i]);
+    // uid_packages[] is aligned 1:1 with uids[]; a NULL array (older daemon) or a NULL/"" entry (a
+    // raw uid:N target) just means the log will carry the bare uid.
+    const char* name = (p->uid_packages && p->uid_packages[i]) ? p->uid_packages[i] : "";
+    prof.uid_names.emplace_back(name);
+  }
+  LOGI("teesim_cfg_add_profile: staged profile '%s' (mode=%s, security_level=%s, %zu package(s), "
+       "%zu uid(s))",
+       prof.id.c_str(), prof.patch_mode ? "patch" : "generation",
+       LevelName(static_cast<SecurityLevel>(p->security_level)),
        prof.packages.size(), prof.uids.size());
   for (const auto& pkg : prof.packages)
-    LOGI("cfg:   package '%s' in user %d", pkg.name.c_str(), pkg.user_id);
+    LOGD("teesim_cfg_add_profile:   package '%s' in user %d", pkg.name.c_str(), pkg.user_id);
   g_staging.push_back(std::move(prof));
   return true;
 }
 
 extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err_len*/) {
-  std::lock_guard<std::mutex> lk(g_cfg_mu);
-  g_profiles = std::move(g_staging);
-  g_staging.clear();
-  g_strongbox_ok = g_stage_strongbox_ok;
-  return static_cast<int>(g_profiles.size());
+  int n = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_cfg_mu);
+    g_profiles = std::move(g_staging);
+    g_staging.clear();
+    g_strongbox_ok = g_stage_strongbox_ok;
+    n = static_cast<int>(g_profiles.size());
+  }
+  // Release anything parked in WaitForDefaultTa now that there is a TA to serve it.
+  g_cfg_cv.notify_all();
+  return n;
 }
 
 // True if `uid` belongs to a live target profile. The transact hook uses this to scope the RKP
@@ -1053,10 +1695,64 @@ extern "C" bool teesim_is_target_uid(int32_t uid) {
   return false;
 }
 
+// --- RKP-only delete-intent tracking -------------------------------------------------------------
+// g_rkp_deleted: the property names the user deleted, pushed with each config (full replace). The
+// hook consults it to tell a genuine rkp_only=true from one a vendor .prop reasserted after a delete.
+// g_rkp_reassert: names the hook saw reasserted since the last drain; the daemon polls and re-deletes.
+// Both guarded by g_rkp_mu — reached from the app's binder thread (hook) and the control thread (push,
+// drain), never the keystore hot path otherwise.
+static std::mutex g_rkp_mu;
+static std::set<std::string> g_rkp_deleted;
+static std::set<std::string> g_rkp_reassert;
+
+extern "C" void teesim_cfg_set_rkp_deleted(const char* const* names, size_t n) {
+  std::lock_guard<std::mutex> lk(g_rkp_mu);
+  g_rkp_deleted.clear();
+  for (size_t i = 0; i < n; ++i)
+    if (names[i]) g_rkp_deleted.insert(names[i]);
+  // Drop pending notes for props not in the new deleted set, so a restored prop is not re-deleted.
+  for (auto it = g_rkp_reassert.begin(); it != g_rkp_reassert.end();)
+    it = g_rkp_deleted.count(*it) ? std::next(it) : g_rkp_reassert.erase(it);
+}
+
+// True if [name] is a property the user deleted — i.e. a live value for it is a reassertion we should
+// undo rather than honour. Called by the hook while it holds no other lock.
+extern "C" bool teesim_rkp_is_delete_intent(const char* name) {
+  if (!name) return false;
+  std::lock_guard<std::mutex> lk(g_rkp_mu);
+  return g_rkp_deleted.count(name) != 0;
+}
+
+// Note that [name] was seen live despite a delete intent, so the daemon re-deletes it on its next
+// poll. Idempotent within a drain window; the hook re-notes on every provisioning until it is gone.
+extern "C" void teesim_rkp_note_reassert(const char* name) {
+  if (!name) return;
+  std::lock_guard<std::mutex> lk(g_rkp_mu);
+  if (g_rkp_deleted.count(name)) g_rkp_reassert.insert(name);
+}
+
+extern "C" char* teesim_rkp_reassert_json_alloc(void) {
+  std::string out = "[";
+  {
+    std::lock_guard<std::mutex> lk(g_rkp_mu);
+    bool first = true;
+    for (const auto& n : g_rkp_reassert) {
+      if (!first) out += ",";
+      first = false;
+      out += '"';
+      out += n;  // fixed property names, never user text — no JSON escaping needed
+      out += '"';
+    }
+    g_rkp_reassert.clear();
+  }
+  out += "]";
+  return strdup(out.c_str());
+}
+
 extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, size_t leaf_len,
                                   TsCertSink sink, void* ctx) {
   if (!profile_id || !leaf || leaf_len == 0 || !sink) return false;
-  LOGI("resign: request for profile '%s' (leaf %zu bytes)", profile_id, leaf_len);
+  LOGI("teesim_cfg_resign: request for profile '%s' (leaf %zu bytes)", profile_id, leaf_len);
   TaPtr ta;
   {
     std::lock_guard<std::mutex> lk(g_cfg_mu);
@@ -1069,7 +1765,7 @@ extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, s
     }
   }
   if (!ta) {
-    LOGW("resign: unknown profile '%s'", profile_id);
+    LOGW("teesim_cfg_resign: unknown profile '%s'", profile_id);
     return false;
   }
   // Re-sign the existing leaf exactly as patch mode does for a fresh key: keep its public key and
@@ -1077,7 +1773,8 @@ extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, s
   TsCreationResult* res = nullptr;
   int32_t rc = teesim_km_patch_attestation(ta.get(), leaf, leaf_len, &res);
   if (rc != 0) {
-    LOGW("resign: patch_attestation failed (%d) for profile '%s'", rc, profile_id);
+    LOGW("teesim_cfg_resign: patch_attestation failed rc=%d(%s) for profile '%s'", rc,
+         teesim_km_err_name(rc), profile_id);
     return false;
   }
   size_t n = teesim_km_result_num_certs(res);
@@ -1116,8 +1813,8 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
       // mis-level a SOFTWARE km_compat leg as TEE and wrap it — the SOFTWARE exclusion below keys off
       // this value. getHardwareInfo is an in-process call returning static info, so a failure is not
       // expected; log it so a mis-levelled leg is visible rather than silently assumed TEE.
-      LOGW("teesim_router_new_device: getHardwareInfo failed; keeping fallback security_level=%d "
-           "(real=%p, remote=%d)", security_level, real_binder,
+      LOGW("teesim_router_new_device: getHardwareInfo failed; keeping fallback security_level=%s "
+           "(real=%p, remote=%d)", LevelName(static_cast<SecurityLevel>(security_level)), real_binder,
            real_binder ? AIBinder_isRemote(real_binder) : -1);
     }
   }
@@ -1138,8 +1835,8 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* 
   // keystore2 resolves a distinct IKeyMintDevice for TrustedEnvironment (level 1) and, when present,
   // StrongBox (level 2); each is wrapped by its own local device at its real level. remote=0 marks a
   // legacy km_compat leg, remote=1 a native HAL.
-  LOGI("teesim_router_new_device: local KeyMint device at security_level=%d (real=%p, remote=%d)",
-       security_level, real_binder, real_binder ? AIBinder_isRemote(real_binder) : -1);
+  LOGI("teesim_router_new_device: local KeyMint device at security_level=%s (real=%p, remote=%d)",
+       LevelName(static_cast<SecurityLevel>(security_level)), real_binder, real_binder ? AIBinder_isRemote(real_binder) : -1);
   auto dev = ndk::SharedRefBase::make<TeesimKeyMintDevice>(
       static_cast<SecurityLevel>(security_level), std::move(real));
   ndk::SpAIBinder b = dev->asBinder();

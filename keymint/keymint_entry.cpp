@@ -7,15 +7,17 @@
 // engine driven entirely by control-channel pushes.
 
 #include "control.h"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "km"
 #include "logging.hpp"
 
 // keymint_hook.cpp
 extern "C" bool teesim_hook_install();
 
 extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
-  LOGI("TEESimulator KeyMint interceptor loading");
+  LOGI("entry: KeyMint interceptor loading");
   teesim_control_start();
   bool ok = teesim_hook_install();
-  LOGI("TEESimulator KeyMint interceptor installed=%d (awaiting config push)", ok);
+  LOGI("entry: KeyMint interceptor installed=%d (awaiting config push)", ok);
   return ok;
 }

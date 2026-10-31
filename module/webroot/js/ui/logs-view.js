@@ -141,7 +141,9 @@ export function renderLogs(mount, state, actions) {
 export function renderLogFilters(state, actions) {
   const { filter = {}, tags = [] } = state;
   const selected = selectedTagsOf(filter);
-  const levels = ["V", "D", "I", "W", "E"];
+  // F is a real filter: the collector captures FATAL device-wide regardless of tag, and the Rust
+  // panic hook emits at that level, so "show me only what crashed" is one tap.
+  const levels = ["V", "D", "I", "W", "E", "F"];
   const seg = el("div", { class: "segmented", role: "group", "aria-label": "Minimum level" },
     levels.map((lv) => el("button", {
       type: "button", class: "seg" + (lv === (filter.minLevel || "V") ? " on" : ""),

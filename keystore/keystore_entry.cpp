@@ -11,6 +11,8 @@
 #include <functional>
 
 #include "control.h"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "ks1"
 #include "logging.hpp"
 
 using namespace android;
@@ -25,20 +27,20 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
 
 extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
   int api = teesim_android_api();
-  LOGI("keystore interceptor loading (api=%d, %s transaction codes)", api,
+  LOGI("entry: keystore interceptor loading (api=%d, %s transaction codes)", api,
        api >= 30 ? "Android 11" : "Android 10");
   teesim_control_start();
 
   if (!teesim_install_binder_hook()) {
-    LOGE("keystore: failed to install the binder hook");
+    LOGE("entry: failed to install the binder hook");
     return false;
   }
   sp<IBinder> service = defaultServiceManager()->checkService(String16("android.security.keystore"));
   if (service == nullptr) {
-    LOGE("keystore: android.security.keystore not found");
+    LOGE("entry: android.security.keystore not found");
     return false;
   }
   bool ok = teesim_intercept_service(service, &teesim_ks_handle);
-  LOGI("keystore interceptor installed=%d (awaiting config push)", ok);
+  LOGI("entry: keystore interceptor installed=%d (awaiting config push)", ok);
   return ok;
 }

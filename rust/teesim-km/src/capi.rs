@@ -191,7 +191,16 @@ fn call<T>(f: impl FnOnce() -> Result<T, OpError>) -> Result<T, i32> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => {
-            log::error!("teesim_km op failed: code={} {}", e.code, e.msg);
+            // A code the TA itself returned is a verdict, not a fault: an app decrypting with the
+            // wrong nonce gets VERIFICATION_FAILED and the module did exactly what it should. Only a
+            // local failure — a CBOR encode, a bad parameter, a panic caught below — is an error of
+            // ours, so only that logs at error! and a genuine fault never hides among routine
+            // verdicts such as an AES-GCM tag mismatch.
+            if e.code == ERR_UNKNOWN {
+                log::error!("call: failed locally code={} {}", e.code, e.msg);
+            } else {
+                log::warn!("call: rejected by the TA code={} {}", e.code, e.msg);
+            }
             Err(e.code)
         }
         Err(_) => Err(ERR_UNKNOWN),

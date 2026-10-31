@@ -71,9 +71,8 @@ impl Ta {
         mut key_params: Vec<KeyParam>,
         attestation_key: Option<AttestationKey>,
     ) -> Result<KeyCreationResult, OpError> {
-        log::info!(
-            "teesim_km: generate_key: {} param(s), security_level={:?}, attest_key={}",
-            key_params.len(),
+        log::debug!(
+            "generate_key: security_level={:?}, attest_key={}",
             self.inner.security_level(),
             attestation_key.is_some()
         );
@@ -82,7 +81,7 @@ impl Ta {
         let resp: Result<GenerateKeyResponse, OpError> =
             self.perform(GenerateKeyRequest { key_params, attestation_key });
         let ret = resp?.ret;
-        crate::resign::log_chain("teesim_km: generate_key result", &ret.certificate_chain);
+        crate::resign::log_chain("generate_key result", &ret.certificate_chain);
         Ok(marked_result(ret))
     }
 
@@ -124,9 +123,8 @@ impl Ta {
         key_data: Vec<u8>,
         attestation_key: Option<AttestationKey>,
     ) -> Result<KeyCreationResult, OpError> {
-        log::info!(
-            "teesim_km: import_key: {} param(s), format={:?}, {} key bytes, security_level={:?}, attest_key={}",
-            key_params.len(),
+        log::debug!(
+            "import_key: format={:?}, {} key bytes, security_level={:?}, attest_key={}",
             key_format,
             key_data.len(),
             self.inner.security_level(),
@@ -137,7 +135,7 @@ impl Ta {
         let resp: Result<ImportKeyResponse, OpError> =
             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
         let ret = resp?.ret;
-        crate::resign::log_chain("teesim_km: import_key result", &ret.certificate_chain);
+        crate::resign::log_chain("import_key result", &ret.certificate_chain);
         Ok(marked_result(ret))
     }
 
@@ -149,12 +147,6 @@ impl Ta {
         params: Vec<KeyParam>,
         auth_token: Option<HardwareAuthToken>,
     ) -> Result<InternalBeginResult, OpError> {
-        log::info!(
-            "teesim_km: begin: purpose={:?}, blob_len={}, {} param(s)",
-            purpose,
-            key_blob.len(),
-            params.len()
-        );
         let resp: BeginResponse = self.perform(BeginRequest {
             purpose,
             key_blob: strip_marker(key_blob).to_vec(),
@@ -200,12 +192,6 @@ impl Ta {
         timestamp_token: Option<TimeStampToken>,
         confirmation_token: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, OpError> {
-        log::info!(
-            "teesim_km: finish: op={}, input={} bytes, signature={} bytes",
-            op_handle,
-            input.as_ref().map_or(0, |v| v.len()),
-            signature.as_ref().map_or(0, |v| v.len())
-        );
         let resp: FinishResponse = self.perform(FinishRequest {
             op_handle,
             input,
@@ -226,7 +212,7 @@ impl Ta {
     /// earlyBootEnded: latch the end of early boot so our EARLY_BOOT_ONLY keys stop working, matching
     /// the transition keystore2 signals to the real HAL.
     pub fn early_boot_ended(&mut self) -> Result<(), OpError> {
-        log::info!("teesim_km: early_boot_ended");
+        log::info!("early_boot_ended");
         let _: EarlyBootEndedResponse = self.perform(EarlyBootEndedRequest {})?;
         Ok(())
     }
@@ -237,7 +223,7 @@ impl Ta {
         &mut self,
         info: Vec<KeyParam>,
     ) -> Result<(), OpError> {
-        log::info!("teesim_km: set_additional_attestation_info: {} param(s)", info.len());
+        log::debug!("set_additional_attestation_info");
         let _: SetAdditionalAttestationInfoResponse =
             self.perform(SetAdditionalAttestationInfoRequest { info })?;
         Ok(())
@@ -245,7 +231,7 @@ impl Ta {
 
     /// deleteKey. `key_blob` is a marked blob.
     pub fn delete_key(&mut self, key_blob: &[u8]) -> Result<(), OpError> {
-        log::info!("teesim_km: delete_key: blob_len={}", key_blob.len());
+        log::debug!("delete_key: blob_len={}", key_blob.len());
         let _: DeleteKeyResponse =
             self.perform(DeleteKeyRequest { key_blob: strip_marker(key_blob).to_vec() })?;
         Ok(())
@@ -257,10 +243,9 @@ impl Ta {
         key_blob: &[u8],
         upgrade_params: Vec<KeyParam>,
     ) -> Result<Vec<u8>, OpError> {
-        log::info!(
-            "teesim_km: upgrade_key: blob_len={}, {} param(s)",
-            key_blob.len(),
-            upgrade_params.len()
+        log::debug!(
+            "upgrade_key: blob_len={}",
+            key_blob.len()
         );
         let resp: UpgradeKeyResponse = self.perform(UpgradeKeyRequest {
             key_blob_to_upgrade: strip_marker(key_blob).to_vec(),
@@ -276,7 +261,7 @@ impl Ta {
         app_id: Vec<u8>,
         app_data: Vec<u8>,
     ) -> Result<Vec<KeyCharacteristics>, OpError> {
-        log::info!("teesim_km: get_key_characteristics: blob_len={}", key_blob.len());
+        log::debug!("get_key_characteristics: blob_len={}", key_blob.len());
         let resp: GetKeyCharacteristicsResponse = self.perform(GetKeyCharacteristicsRequest {
             key_blob: strip_marker(key_blob).to_vec(),
             app_id,
@@ -343,7 +328,9 @@ fn ensure_creation_datetime(params: &mut Vec<KeyParam>) {
         return;
     }
     let ms_since_epoch = device::realtime_ms_since_epoch();
-    log::info!("teesim_km: adding CreationDatetime={ms_since_epoch} (keystore2 omitted it)");
+    log::debug!(
+        "ensure_creation_datetime: adding creation_datetime={ms_since_epoch} (keystore2 omitted it)"
+    );
     params.push(KeyParam::CreationDatetime(DateTime { ms_since_epoch }));
 }
 

@@ -27,54 +27,71 @@ object App {
     @Volatile private lateinit var appContext: Context
     // The frozen captured harvest (raw device state + computed default overrides). Never re-merged.
     @Volatile private lateinit var capturedBase: Harvester.Record
-    // capturedBase with the user's overrides.json layered on — what we present and push. Recomputed on
-    // every resolveAndPush, so an edit to overrides.json (which trips the DATA_DIR watcher) takes effect.
+    // capturedBase with the user's overrides.json layered on — what we present and push. Recomputed
+    // on every resolveAndPush, so an edit to overrides.json (which trips the DATA_DIR watcher)
+    // takes effect.
     @Volatile private lateinit var harvest: Harvester.Record
     @Volatile private var lastGoodConfig: ConfigStore.Config? = null
-    // Cleared after the first committed push, so the startup-only attest-key purge runs exactly once.
+    // Cleared after the first committed push, so the startup-only attest-key purge runs exactly
+    // once.
     private val firstCommit = java.util.concurrent.atomic.AtomicBoolean(true)
 
     // How often the usage poll asks the lib for its per-uid key-request tallies.
     private const val USAGE_POLL_MS = 15_000L
-    // Serializes the WHOLE fetch→delta→apply cycle of [pollUsageOnce]. Two callers race — the 15s poll
-    // thread and KeyAdmin's /packages handler (its own thread) — and although Control.fetchUsage is
-    // itself serialized, applying two snapshots out of order would drive a stale (smaller) count into
-    // UsageStore's "count shrank ⇒ lib restarted" branch and fold a whole cumulative as a phantom delta.
-    // A DEDICATED lock (never the App monitor, which resolveAndPush holds) keeps polls single-file
-    // without blocking the config path across the multi-second fetch.
+    // Serializes the WHOLE fetch→delta→apply cycle of [pollUsageOnce]. Two callers race — the 15s
+    // poll thread and KeyAdmin's /packages handler (its own thread) — and although
+    // Control.fetchUsage is itself serialized, applying two snapshots out of order would drive a
+    // stale (smaller) count into UsageStore's "count shrank ⇒ lib restarted" branch and fold a
+    // whole cumulative as a phantom delta. A DEDICATED lock (never the App monitor, which
+    // resolveAndPush holds) keeps polls single-file without blocking the config path across the
+    // multi-second fetch.
     private val usagePollLock = Any()
+    // The last reported snapshot, so pollUsageOnce logs a change rather than every fifteen-second
+    // tick. Both the reported and the merged count are compared (apps.length() alone can repeat
+    // while individual counters still climb), so silence means "nothing changed".
+    @Volatile private var lastPollReported = -1
+    @Volatile private var lastPollMerged = -1
+    // A DEBUG line every this many polls, confirming the thread is alive during a long silent
+    // stretch.
+    private const val USAGE_POLL_HEARTBEAT_EVERY = 40 // ~10 minutes at USAGE_POLL_MS
+    private var usagePollTick = 0
 
-    // Shared body of the owner-scoped helper children the daemon spawns (see main). keystore2 authorizes
-    // an owner-only operation on a key by the caller's EFFECTIVE uid, so we seteuid to the key's owner and
-    // then run [action] against keystore2 as that app. Our real uid stays root and this is a throwaway
-    // process, so the euid drop is never reverted. [label] only names the caller in the log. Exit code:
-    // 0 success, 1 keystore2 refused (or [action] threw), 2 could-not-seteuid — the parent falls back to
-    // a direct database write on anything non-zero.
-    @Suppress("DEPRECATION") // Os.seteuid is deprecated but is the only way to set the binder-reported euid
+    // Shared body of the owner-scoped helper children the daemon spawns (see main). keystore2
+    // authorizes an owner-only operation on a key by the caller's EFFECTIVE uid, so we seteuid to
+    // the key's owner and then run [action] against keystore2 as that app. Our real uid stays root
+    // and this is a throwaway process, so the euid drop is never reverted. [label] only names the
+    // caller in the log. Exit code: 0 success, 1 keystore2 refused (or [action] threw), 2
+    // could-not-seteuid — the parent falls back to a direct database write on anything non-zero.
+    @Suppress(
+        "DEPRECATION"
+    ) // Os.seteuid is deprecated but is the only way to set the binder-reported euid
     private fun runAsOwner(label: String, uid: Int, action: () -> Boolean): Int {
         if (uid < 0) return 2
         try {
             android.system.Os.seteuid(uid)
         } catch (e: Throwable) {
-            SystemLogger.warning("$label: seteuid($uid) failed: ${e.javaClass.simpleName}: ${e.message}")
+            SystemLogger.warning(
+                "App.runAsOwner: $label seteuid($uid) failed: ${e.javaClass.simpleName}: ${e.message}"
+            )
             return 2
         }
         return try {
             if (action()) 0 else 1
         } catch (e: Throwable) {
-            SystemLogger.warning("$label: keystore2 call as euid=$uid failed", e)
+            SystemLogger.warning("App.runAsOwner: $label keystore2 call as euid=$uid failed", e)
             1
         }
     }
 
-    // The delete-helper child body (see main): delete the key as its owner — only the owner's delete
-    // evicts keystore2's in-memory cache (a direct database delete does not).
+    // The delete-helper child body (see main): delete the key as its owner — only the owner's
+    // delete evicts keystore2's in-memory cache (a direct database delete does not).
     private fun runDeleteHelper(uid: Int, keyId: Long): Int =
         runAsOwner("delete-helper", uid) { Keystore2Service.deleteKeyById(keyId) }
 
-    // The resign-helper child body (see main): swap the key's stored certificates as its owner. The leaf
-    // and the rest of the chain are read (as root) from the two files the parent wrote, BEFORE dropping
-    // to the owner uid; an unreadable file is reported as a refusal so the parent takes the DB fallback.
+    // The resign-helper child body (see main): swap the key's stored certificates as its owner. The
+    // leaf and the rest of the chain are read (as root) from the two files the parent wrote, BEFORE
+    // dropping to the owner uid; an unreadable file is reported as a refusal so the parent takes
+    // the DB fallback.
     private fun runResignHelper(uid: Int, keyId: Long, leafPath: String, chainPath: String): Int {
         val leaf: ByteArray
         val chain: ByteArray
@@ -82,10 +99,14 @@ object App {
             leaf = java.io.File(leafPath).readBytes()
             chain = java.io.File(chainPath).readBytes()
         } catch (e: Throwable) {
-            SystemLogger.warning("resign-helper: reading cert files failed: ${e.javaClass.simpleName}: ${e.message}")
+            SystemLogger.warning(
+                "App.runResignHelper: reading cert files failed: ${e.javaClass.simpleName}: ${e.message}"
+            )
             return 1
         }
-        return runAsOwner("resign-helper", uid) { Keystore2Service.updateSubcomponent(keyId, leaf, chain) }
+        return runAsOwner("resign-helper", uid) {
+            Keystore2Service.updateSubcomponent(keyId, leaf, chain)
+        }
     }
 
     @JvmStatic
@@ -93,7 +114,9 @@ object App {
         // Delete-helper mode (a child the daemon spawns to delete one key as its owning app — see
         // runDeleteHelper). Runs before any daemon setup and exits with the outcome as its code.
         if (args.size == 3 && args[0] == "del") {
-            kotlin.system.exitProcess(runDeleteHelper(args[1].toIntOrNull() ?: -1, args[2].toLongOrNull() ?: 0L))
+            kotlin.system.exitProcess(
+                runDeleteHelper(args[1].toIntOrNull() ?: -1, args[2].toLongOrNull() ?: 0L)
+            )
         }
         // Resign-helper mode (a child spawned to re-root one pre-existing key's certificates as its
         // owning app — see runResignHelper). Same throwaway-child pattern as "del".
@@ -107,10 +130,17 @@ object App {
                 )
             )
         }
-        SystemLogger.info("TEESimulator control daemon starting")
-        // Start the in-process log reader first, so even the boot-time bootstrap below is captured for
-        // the WebUI's Logs panel (the reader is a native thread; it does not depend on the framework).
-        startLogReader(resolveModuleDir(args))
+        // Taken before the first line is logged: the reader attaches to logd from this instant,
+        // so everything below is captured even though the reader is still starting.
+        val startedAt = System.currentTimeMillis()
+        SystemLogger.info("App: daemon starting")
+        // Start the in-process log reader first, so even the boot-time bootstrap below is captured
+        // for the WebUI's Logs panel (the reader is a native thread; it does not depend on the
+        // framework).
+        startLogReader(resolveModuleDir(args), startedAt)
+        // Written into the log itself, not only into a bundle: a log usually reaches an issue as
+        // pasted text, which must identify the module version, the device and the date on its own.
+        Report.logHeader()
         try {
             waitForSystemReady()
             appContext = prepareEnvironment()
@@ -128,8 +158,8 @@ object App {
 
             Packages.init(appContext)
 
-            // Real-key harvest (frozen verifiedBoot*), persisted to harvested.json. Then layer the user's
-            // overrides.json over it for the record we actually present.
+            // Real-key harvest (frozen verifiedBoot*), persisted to harvested.json. Then layer the
+            // user's overrides.json over it for the record we actually present.
             capturedBase = Harvester.run(appContext)
             harvest = Harvester.applyUserOverrides(capturedBase, OverrideStore.load())
 
@@ -144,20 +174,28 @@ object App {
             Injector(resolveModuleDir(args)).start()
 
             // Control channel + initial push, then watch config and packages. After each committed
-            // push the lib acks; that is when pre-existing target keys are re-attested to the keybox.
+            // push the lib acks; that is when pre-existing target keys are re-attested to the
+            // keybox.
             Control.onCommitted = {
-            lastGoodConfig?.let { cfg ->
-                // On the first committed push (daemon start) clear each target's stale attestation key
-                // so it is regenerated through the TA — an attest key must be ours to patch the leaves
-                // it later signs. If that purge restarts keystore2, skip re-attestation this round: the
-                // restart re-injects and re-pushes, and re-attestation runs then against a live keystore.
-                val restarting = firstCommit.getAndSet(false) && ReAttest.purgeTargetAttestKeys(cfg)
-                if (!restarting) ReAttest.run(cfg)
+                lastGoodConfig?.let { cfg ->
+                    // On the first committed push (daemon start) clear each target's stale
+                    // attestation key so it is regenerated through the TA — an attest key must be
+                    // ours to patch the leaves it later signs. If that purge restarts keystore2,
+                    // skip re-attestation this round: the restart re-injects and re-pushes, and
+                    // re-attestation runs then against a live keystore.
+                    val restarting =
+                        firstCommit.getAndSet(false) && ReAttest.purgeTargetAttestKeys(cfg)
+                    if (!restarting) ReAttest.run(cfg)
+                }
             }
-        }
+            // The hook reports an rkp_only prop it saw reasserted despite a delete intent (#262);
+            // re-delete it live here, off the control reader thread, so the next provisioning reads
+            // it unset and takes the keybox path.
+            Control.onRkpReassert = { names -> reEnforceRkpDeletions(names) }
             Control.start()
-            // Freeze the auto-include baseline (known_packages.json) at a known moment, before the first
-            // resolve reads it — so "future installs only" is measured from daemon-start, not lazily.
+            // Freeze the auto-include baseline (known_packages.json) at a known moment, before the
+            // first resolve reads it — so "future installs only" is measured from daemon-start, not
+            // lazily.
             Scope.baselineKnownPackages()
             resolveAndPush()
             ConfigStore.watch { resolveAndPush() }
@@ -168,22 +206,33 @@ object App {
             // no-ops from 34 on). So the set of installed apps is only ever re-read here, on a
             // config change, and at daemon start.
             KeyAdmin.onRescan = { resolveAndPush() }
+            // The WebUI deletes/restores an RKP-only property through the daemon (POST /rkp/*), so
+            // the live resetprop, the rkp.json delete-intent and the re-push that hands the new
+            // intent set to the hook form one atomic, lock-ordered step with the boot/push
+            // re-enforce.
+            KeyAdmin.onRkp = { action, name ->
+                when (action) {
+                    "delete" -> deleteRkpProp(name)
+                    "restore" -> restoreRkpProp(name)
+                    else -> false
+                }
+            }
             startUsagePoll()
 
-            SystemLogger.info("Daemon initialised; entering main loop")
+            SystemLogger.info("App: daemon initialised; entering main loop")
             Looper.loop()
         } catch (e: Throwable) {
-            SystemLogger.error("Fatal error in daemon main", e)
+            SystemLogger.error("App: fatal error in daemon main", e)
             throw e
         }
     }
 
     /**
      * The first app_process at boot can start before system_server, and then
-     * ActivityThread.systemMain()/getSystemContext() NPE deep in the framework —
-     * only the service.sh respawn recovers. main fixed this (#99) by waiting for a
-     * core system service first. "package" is one of the last services system_server
-     * registers, so once it answers the framework is fully up.
+     * ActivityThread.systemMain()/getSystemContext() NPE deep in the framework — only the
+     * service.sh respawn recovers. main fixed this (#99) by waiting for a core system service
+     * first. "package" is one of the last services system_server registers, so once it answers the
+     * framework is fully up.
      */
     private fun waitForSystemReady() {
         try {
@@ -202,7 +251,7 @@ object App {
                 return
             }
         }
-        SystemLogger.warning("system_server not ready after 70s; bootstrapping anyway")
+        SystemLogger.warning("App: system_server not ready after 70s; bootstrapping anyway")
     }
 
     /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */
@@ -211,15 +260,18 @@ object App {
             @Suppress("DEPRECATION") Looper.prepareMainLooper()
         }
         val activityThread = ActivityThread.systemMain()
-        // getSystemContext() can still NPE on the very first launch; the readiness
-        // gate above usually makes the first attempt succeed, but retry to be safe.
-        var systemContext: Any? = null // stub getSystemContext() returns ContextImpl, passed reflectively
+        // getSystemContext() can still NPE on the very first launch; the readiness gate above
+        // usually makes the first attempt succeed, but retry to be safe.
+        var systemContext: Any? =
+            null // stub getSystemContext() returns ContextImpl, passed reflectively
         for (attempt in 0 until 5) {
             try {
                 systemContext = activityThread.getSystemContext()
                 if (systemContext != null) break
             } catch (e: Throwable) {
-                SystemLogger.warning("getSystemContext attempt ${attempt + 1} failed: ${e.message}")
+                SystemLogger.warning(
+                    "App: getSystemContext attempt ${attempt + 1} failed: ${e.message}"
+                )
             }
             try {
                 Thread.sleep(1000)
@@ -245,24 +297,27 @@ object App {
     /**
      * Stop SQLiteDatabase from reading device settings on its first open in this process. Planting
      * mInitialApplication above (so KeyStore/PackageManager see a context) makes
-     * ActivityThread.currentApplication() non-null, and SQLiteDatabase's constructor then reaches into
-     * settings the way a normal app would. Our process is not an AMS-registered app, so on some ROMs
-     * resolving a provider throws ("Unable to find app for caller"), and every openDatabase() — hence
-     * every KeystoreDb read — fails, leaving the WebUI key list empty. We pre-seed the framework's
-     * cached settings so those lookups never run. Two independent reads have to be defused:
+     * ActivityThread.currentApplication() non-null, and SQLiteDatabase's constructor then reaches
+     * into settings the way a normal app would. Our process is not an AMS-registered app, so on
+     * some ROMs resolving a provider throws ("Unable to find app for caller"), and every
+     * openDatabase() — hence every KeystoreDb read — fails, leaving the WebUI key list empty. We
+     * pre-seed the framework's cached settings so those lookups never run. Two independent reads
+     * have to be defused:
      *
-     * - OnePlus builds have SQLiteGlobal consult a package list (getPkgs/BenchAppList) to pick a sync
-     *   mode. Seeding sDefaultSyncMode to NORMAL short-circuits that before it touches PackageManager.
-     * - Stock SQLiteCompatibilityWalFlags.initIfNeeded() reads Settings.Global.getString() under only a
-     *   try/finally. Marking the class initialised returns early before it touches settings; its
-     *   defaults (no compat-WAL overrides) are exactly what our read-only snapshot reads want.
+     * - OnePlus builds have SQLiteGlobal consult a package list (getPkgs/BenchAppList) to pick a
+     *   sync mode. Seeding sDefaultSyncMode to NORMAL short-circuits that before it touches
+     *   PackageManager.
+     * - Stock SQLiteCompatibilityWalFlags.initIfNeeded() reads Settings.Global.getString() under
+     *   only a try/finally. Marking the class initialised returns early before it touches settings;
+     *   its defaults (no compat-WAL overrides) are exactly what our read-only snapshot reads want.
      *
      * Each step is best effort: a framework that lays the class out differently just keeps the old
      * behaviour.
      */
     private fun neutralizeSqliteSettingsReads() {
-        // OnePlus compares the current package against a BenchAppList to decide the sync mode; seeding
-        // sDefaultSyncMode keeps SQLiteGlobal from calling getPkgs() through PackageManager.
+        // OnePlus compares the current package against a BenchAppList to decide the sync mode;
+        // seeding sDefaultSyncMode keeps SQLiteGlobal from calling getPkgs() through
+        // PackageManager.
         try {
             val syncMode =
                 Class.forName("android.database.sqlite.SQLiteGlobal")
@@ -270,10 +325,12 @@ object App {
                     .apply { isAccessible = true }
             if (syncMode.get(null) == null) {
                 syncMode.set(null, "NORMAL")
-                SystemLogger.info("SQLiteGlobal.sDefaultSyncMode seeded NORMAL (skip getPkgs on DB open)")
+                SystemLogger.info(
+                    "App: SQLiteGlobal.sDefaultSyncMode seeded NORMAL (skip getPkgs on DB open)"
+                )
             }
         } catch (e: Throwable) {
-            SystemLogger.verbose("SQLiteGlobal sync-mode guard not applied: ${e.message}")
+            SystemLogger.verbose("App: SQLiteGlobal sync-mode guard not applied: ${e.message}")
         }
 
         // Stock AOSP settings dependency: present since API 28, absent on some newer builds.
@@ -281,15 +338,21 @@ object App {
             try {
                 val walFlags = Class.forName("android.database.sqlite.SQLiteCompatibilityWalFlags")
                 // Mark initialised so initIfNeeded() returns before reading Settings.Global.
-                walFlags.getDeclaredField("sInitialized").apply { isAccessible = true }.setBoolean(null, true)
-                // Secondary recursion guard, in case a build reorders the initIfNeeded() short-circuit.
+                walFlags
+                    .getDeclaredField("sInitialized")
+                    .apply { isAccessible = true }
+                    .setBoolean(null, true)
+                // Secondary recursion guard, in case a build reorders the initIfNeeded()
+                // short-circuit.
                 walFlags
                     .getDeclaredField("sCallingGlobalSettings")
                     .apply { isAccessible = true }
                     .setBoolean(null, true)
-                SystemLogger.info("SQLiteCompatibilityWalFlags neutralised (skip Settings.Global on DB open)")
+                SystemLogger.info(
+                    "App: SQLiteCompatibilityWalFlags neutralised (skip Settings.Global on DB open)"
+                )
             } catch (e: Throwable) {
-                SystemLogger.warning("Could not neutralise SQLiteCompatibilityWalFlags", e)
+                SystemLogger.warning("App: cannot neutralise SQLiteCompatibilityWalFlags", e)
             }
         }
     }
@@ -300,23 +363,35 @@ object App {
      */
     @Synchronized
     private fun resolveAndPush(): Int {
-        // Re-layer the user's overrides.json over the frozen capture — an override edit trips the same
-        // DATA_DIR watcher that calls us, so this is where a changed override becomes live. Refresh the
-        // record the WebUI reads, and reflect any boot key/hash override into ro.boot.vbmeta.*.
+        // Re-layer the user's overrides.json over the frozen capture — an override edit trips the
+        // same DATA_DIR watcher that calls us, so this is where a changed override becomes live.
+        // Refresh the record the WebUI reads, and reflect any boot key/hash override into
+        // ro.boot.vbmeta.*.
         harvest = Harvester.applyUserOverrides(capturedBase, OverrideStore.load())
         KeyAdmin.updateHarvest(harvest)
         applyBootProps(harvest)
+        applyRkpDeletions()
         try {
             lastGoodConfig = ConfigStore.load()
         } catch (e: ConfigStore.ConfigException) {
-            SystemLogger.error("config.json invalid; keeping last-good: ${e.message}")
+            SystemLogger.error("App: config.json invalid; keeping last-good: ${e.message}")
         } catch (e: Exception) {
-            SystemLogger.error("config.json read failed; keeping last-good", e)
+            SystemLogger.error("App: config.json read failed; keeping last-good", e)
         }
         val cfg =
             lastGoodConfig
                 ?: run {
-                    SystemLogger.warning("No valid config yet; nothing to push")
+                    // The injected library is already serving keystore2's KeyMint by now, and it
+                    // cannot answer an operation on one of OUR key blobs until this push builds the
+                    // TA that holds the key-encryption key. It parks such an operation briefly and
+                    // then reports the hardware as unavailable — at which point an app is liable to
+                    // delete the alias and mint a fresh key, losing everything the old one had
+                    // encrypted. So this is not a quiet "nothing to do" state.
+                    SystemLogger.error(
+                        "App: no valid config to push — keys minted by TEESimulator cannot be used until " +
+                            "one exists, and an app that gives up on such a key may regenerate it " +
+                            "and lose the data it had encrypted. Fix config.json/the keybox."
+                    )
                     return -1
                 }
         return try {
@@ -324,17 +399,18 @@ object App {
             Control.push(msg.toString())
             countTargetUids(msg)
         } catch (e: Exception) {
-            SystemLogger.error("Failed to resolve/push config", e)
+            SystemLogger.error("App: resolving/pushing config failed", e)
             -1
         }
     }
 
     /**
-     * How many distinct caller uids the freshly pushed config targets, read back off the wire message
-     * rather than re-resolving — [Scope.resolve] enumerates every installed app when a profile
-     * auto-includes, and doing that twice per rescan just to count would double the cost of the
-     * WebUI's pull-to-refresh. Deduplicated across profiles, since the same uid never legally appears
-     * in two of them but a count that silently double-reported would be a confusing thing to show.
+     * How many distinct caller uids the freshly pushed config targets, read back off the wire
+     * message rather than re-resolving — [Scope.resolve] enumerates every installed app when a
+     * profile auto-includes, and doing that twice per rescan just to count would double the cost of
+     * the WebUI's pull-to-refresh. Deduplicated across profiles, since the same uid never legally
+     * appears in two of them but a count that silently double-reported would be a confusing thing
+     * to show.
      */
     private fun countTargetUids(msg: JSONObject): Int {
         val profiles = msg.optJSONArray("profiles") ?: return 0
@@ -347,17 +423,17 @@ object App {
     }
 
     /**
-     * The background loop that keeps [UsageStore] current: every [USAGE_POLL_MS] it polls the lib for
-     * its per-uid key-request tallies and folds the deltas in ([pollUsageOnce]). Runs off the control
-     * reader thread (Control delivers the reply there), so it lives on its own daemon thread. A slow or
-     * absent lib just means an empty poll; the loop keeps going.
+     * The background loop that keeps [UsageStore] current: every [USAGE_POLL_MS] it polls the lib
+     * for its per-uid key-request tallies and folds the deltas in ([pollUsageOnce]). Runs off the
+     * control reader thread (Control delivers the reply there), so it lives on its own daemon
+     * thread. A slow or absent lib just means an empty poll; the loop keeps going.
      */
     private fun startUsagePoll() {
         Thread({ usagePollLoop() }, "teesim-usage-poll").apply {
             isDaemon = true
             start()
         }
-        SystemLogger.info("Usage poll thread started (every ${USAGE_POLL_MS}ms)")
+        SystemLogger.info("App: usage poll thread started (every ${USAGE_POLL_MS}ms)")
     }
 
     private fun usagePollLoop() {
@@ -370,75 +446,209 @@ object App {
             try {
                 pollUsageOnce()
             } catch (e: Throwable) {
-                SystemLogger.warning("usage poll: iteration failed: ${e.message}")
+                SystemLogger.warning("App: usage poll iteration failed: ${e.message}")
             }
         }
     }
 
     /**
-     * Ask the lib for its usage snapshot and fold it into [UsageStore]. For each reported uid: resolve a
-     * representative package (PackageManager reverse map, or the lib's pkg hint as a fallback), convert
-     * the CLOCK_BOOTTIME lastBootMs to a wall-clock epoch via the current boot/wall offset, and hand it
-     * to [UsageStore.applyLibSample], which owns the per-uid cursor and the delta math under its own
-     * lock. This method therefore holds NO lock — in particular it must never block the config path:
-     * [Control.fetchUsage] can wait seconds for the lib, and an earlier version @Synchronized on the App
-     * monitor (shared with [resolveAndPush]) stalled config pushes for that whole window.
+     * Ask the lib for its usage snapshot and fold it into [UsageStore]. For each reported uid:
+     * resolve a representative package (PackageManager reverse map, or the lib's pkg hint as a
+     * fallback), convert the CLOCK_BOOTTIME lastBootMs to a wall-clock epoch via the current
+     * boot/wall offset, and hand it to [UsageStore.applyLibSample], which owns the per-uid cursor
+     * and the delta math under its own lock. This method therefore holds NO lock — in particular it
+     * must never block the config path: [Control.fetchUsage] can wait seconds for the lib, and an
+     * earlier version @Synchronized on the App monitor (shared with [resolveAndPush]) stalled
+     * config pushes for that whole window.
      */
-    fun pollUsageOnce() = synchronized(usagePollLock) {
-        val apps = Control.fetchUsage() ?: return@synchronized
-        val bootNowMs = SystemClock.elapsedRealtime()
-        val wallNow = System.currentTimeMillis()
-        var recorded = 0
-        for (i in 0 until apps.length()) {
-            val e = apps.optJSONObject(i) ?: continue
-            val uid = e.optInt("uid", -1)
-            if (uid < 0) continue
-            val current = e.optLong("count", 0L)
-            val lastBootMs = e.optLong("lastBootMs", 0L)
-            val hint = e.optString("pkg", "")
+    fun pollUsageOnce() =
+        synchronized(usagePollLock) {
+            val apps = Control.fetchUsage() ?: return@synchronized
+            val bootNowMs = SystemClock.elapsedRealtime()
+            val wallNow = System.currentTimeMillis()
+            var recorded = 0
+            for (i in 0 until apps.length()) {
+                val e = apps.optJSONObject(i) ?: continue
+                val uid = e.optInt("uid", -1)
+                if (uid < 0) continue
+                val current = e.optLong("count", 0L)
+                val lastBootMs = e.optLong("lastBootMs", 0L)
+                val hint = e.optString("pkg", "")
 
-            val pkg = Packages.packagesForUid(uid).firstOrNull()?.takeIf { it.isNotEmpty() }
-                ?: hint.takeIf { it.isNotEmpty() }
-                ?: continue // no resolvable package: leave the cursor untouched so the count isn't lost
-            // Remembered under the app token, not the bare package: a work profile's copy of an app is
-            // a different caller and deserves its own count, and the token is also what the Scope
-            // picker and config.json spell it as.
-            val token = Scope.entryToken(pkg, Packages.userIdOf(uid))
-            // lastBootMs is on CLOCK_BOOTTIME; the same offset (wallNow - bootNowMs) maps it to wall time.
-            val lastUsedEpoch = if (lastBootMs > 0) wallNow - (bootNowMs - lastBootMs) else wallNow
-            UsageStore.applyLibSample(uid, token, current, lastUsedEpoch)
-            recorded++
+                val pkg =
+                    Packages.packagesForUid(uid).firstOrNull()?.takeIf { it.isNotEmpty() }
+                        ?: hint.takeIf { it.isNotEmpty() }
+                        ?: continue // no resolvable package: leave the cursor untouched so the
+                // count isn't lost Remembered under the app token, not the bare package: a work
+                // profile's copy of an app is a different caller and deserves its own count, and
+                // the token is also what the Scope picker and config.json spell it as.
+                val token = Scope.entryToken(pkg, Packages.userIdOf(uid))
+                // lastBootMs is on CLOCK_BOOTTIME; the same offset (wallNow - bootNowMs) maps it to
+                // wall time.
+                val lastUsedEpoch =
+                    if (lastBootMs > 0) wallNow - (bootNowMs - lastBootMs) else wallNow
+                UsageStore.applyLibSample(uid, token, current, lastUsedEpoch)
+                recorded++
+            }
+            val reported = apps.length()
+            usagePollTick++
+            if (reported != lastPollReported || recorded != lastPollMerged) {
+                SystemLogger.info("App: usage poll $reported uid(s) reported, $recorded merged")
+                lastPollReported = reported
+                lastPollMerged = recorded
+            } else if (usagePollTick % USAGE_POLL_HEARTBEAT_EVERY == 0) {
+                SystemLogger.debug(
+                    "App: usage poll unchanged ($reported uid(s), $recorded merged) for " +
+                        "$USAGE_POLL_HEARTBEAT_EVERY polls"
+                )
+            }
         }
-        SystemLogger.info("usage poll: ${apps.length()} uid(s) reported, $recorded merged")
-    }
 
     /**
-     * Force the matching ro.boot.vbmeta.* property to the boot key/hash we actually PRESENT (the override
-     * when one is active, else the real captured value), so anything reading those props directly sees
-     * exactly what attestation reports. We compare against the LIVE property and overwrite it on any
-     * mismatch — the value we attest wins unconditionally, whether the property was empty (some bootloaders
-     * never populate ro.boot.vbmeta.digest — unlocked / verification-disabled / OEM AVB, #228), stale, or
-     * changed by another module. A match is left untouched, so a steady state does no work.
+     * Force the matching ro.boot.vbmeta.* property to the boot key/hash we actually PRESENT (the
+     * override when one is active, else the real captured value), so anything reading those props
+     * directly sees exactly what attestation reports. We compare against the LIVE property and
+     * overwrite it on any mismatch — the value we attest wins unconditionally, whether the property
+     * was empty (some bootloaders never populate ro.boot.vbmeta.digest — unlocked /
+     * verification-disabled / OEM AVB, #228), stale, or changed by another module. A match is left
+     * untouched, so a steady state does no work.
      */
     private fun applyBootProps(h: Harvester.Record) {
         for ((prop, value) in Harvester.bootPropValues(h)) {
             val live = DeviceProps.prop(prop, "")
             if (live != value) {
                 SysProp.set(prop, value)
-                SystemLogger.info("boot prop: forced $prop to the attested value (was '${live.ifEmpty { "unset" }}')")
+                SystemLogger.info(
+                    "App: boot prop forced $prop to the attested value (was '${live.ifEmpty { "unset" }}')"
+                )
             }
         }
     }
 
     /**
-     * Load and start [LogTail]'s native log reader from the module's per-ABI library directory. The ABI
-     * is chosen exactly as the [Injector] chooses the interceptor's — the daemon's own primary ABI, with
-     * a device-property fallback — since both artifacts ship side by side under `<abi>/`.
+     * Load and start [LogTail]'s native log reader from the module's per-ABI library directory. The
+     * ABI is chosen exactly as the [Injector] chooses the interceptor's — the daemon's own primary
+     * ABI, with a device-property fallback — since both artifacts ship side by side under `<abi>/`.
      */
-    private fun startLogReader(moduleDir: File) {
+    private fun startLogReader(moduleDir: File, startedAt: Long) {
         val abi =
-            Build.SUPPORTED_ABIS?.firstOrNull() ?: DeviceProps.prop("ro.product.cpu.abi", "arm64-v8a")
-        LogTail.start(File(moduleDir, "$abi/libteesim_logcat.so"))
+            Build.SUPPORTED_ABIS?.firstOrNull()
+                ?: DeviceProps.prop("ro.product.cpu.abi", "arm64-v8a")
+        LogTail.start(File(moduleDir, "$abi/libteesim_logcat.so"), startedAt)
+    }
+
+    /**
+     * Enforce the user's RKP-only *delete intents* (rkp.json): delete any `remote_provisioning.*`
+     * knob that is marked deleted yet reads back present. Those props are plain (not `persist.*`)
+     * and a device can ship them `true` in a vendor `.prop` that init re-applies every boot
+     * (OnePlus Android 16, #236), so a deleted prop reappears on the next boot. Runs from
+     * resolveAndPush — its first call is daemon start, and it runs again on every later push, so a
+     * reappearance is cleared at the next push. keystore2 and our hook both read an unset prop as
+     * false, so the keybox path holds with no retrigger. A device that re-asserts the prop between
+     * pushes, hours after boot (#262), is handled by [reEnforceRkpDeletions] off the hook's report
+     * instead.
+     */
+    private fun applyRkpDeletions() {
+        for ((name, _) in RkpStore.load()) {
+            val live = DeviceProps.prop(name, "")
+            if (live.isEmpty()) continue // already absent
+            if (SysProp.delete(name))
+                SystemLogger.info("App: rkp prop re-deleted $name (reappeared as '$live')")
+            else SystemLogger.warning("App: rkp prop $name reappeared as '$live' but delete failed")
+        }
+    }
+
+    /**
+     * Delete the RKP-only knobs the hook reports it saw present despite a delete intent (#262),
+     * reported on the getUsage reply. Runs under the push lock, so it cannot interleave with
+     * [applyRkpDeletions] or a delete/restore. Keys off the intent store, not the reported names: a
+     * knob the user restored between the hook's report and this call carries no intent and is left
+     * alone.
+     */
+    @Synchronized
+    fun reEnforceRkpDeletions(reported: List<String>) {
+        val intents = RkpStore.load()
+        for (name in reported) {
+            if (name !in intents) {
+                SystemLogger.info("App: rkp lazy re-delete skipped $name (no delete intent)")
+                continue
+            }
+            val live = DeviceProps.prop(name, "")
+            if (live.isEmpty()) continue // already absent
+            if (SysProp.delete(name))
+                SystemLogger.info("App: rkp lazy re-delete $name (reasserted to '$live')")
+            else SystemLogger.warning("App: rkp lazy re-delete $name failed (was '$live')")
+        }
+    }
+
+    /**
+     * Delete one RKP-only property live and record the delete intent, as one atomic step. Reached
+     * from the WebUI through `KeyAdmin`'s `POST /rkp/delete`. Because it is `@Synchronized` on the
+     * same monitor as [resolveAndPush] (and therefore [applyRkpDeletions]), the live delete and the
+     * persist can never interleave with a boot/re-push re-enforce. Captures the property's current
+     * value first so [restoreRkpProp] can put exactly that back. Records the intent only when the
+     * live delete took, so the file mirrors the live state. [name] is validated against
+     * [RkpStore.KNOWN] by the caller. Returns whether the property was deleted live.
+     */
+    @Synchronized
+    fun deleteRkpProp(name: String): Boolean {
+        val was = DeviceProps.prop(name, "")
+        val ok = SysProp.delete(name)
+        if (ok) {
+            RkpStore.recordDelete(name, was)
+            SystemLogger.info(
+                "App: rkp prop deleted $name (was '${was.ifEmpty { "unset" }}'); intent persisted"
+            )
+            pushRkpIntents("delete $name")
+        } else {
+            SystemLogger.warning("App: could not delete rkp prop $name live; not recording intent")
+        }
+        return ok
+    }
+
+    /**
+     * Restore one deleted RKP-only property and clear its intent, atomically. Reached through `POST
+     * /rkp/restore`. Sets the property back to the value remembered at deletion, then drops the
+     * intent so [applyRkpDeletions] leaves it alone. When nothing was remembered the property was
+     * already absent when the intent was recorded, so restoring it means leaving it absent: the
+     * intent is dropped and no value is invented — writing a plausible-looking `true` onto a device
+     * that never declared the knob would leave exactly the anomalous reading deletion exists to
+     * avoid. Clears the intent only when the live set took. Returns whether the restore took.
+     */
+    @Synchronized
+    fun restoreRkpProp(name: String): Boolean {
+        val remembered = RkpStore.load()[name].orEmpty()
+        if (remembered.isEmpty()) {
+            RkpStore.clear(name)
+            SystemLogger.info(
+                "App: rkp prop $name was already unset when deleted; intent cleared, leaving it unset"
+            )
+            pushRkpIntents("restore $name")
+            return true
+        }
+        val ok = SysProp.set(name, remembered)
+        if (ok) {
+            RkpStore.clear(name)
+            SystemLogger.info("App: rkp prop restored $name=$remembered; intent cleared")
+            pushRkpIntents("restore $name")
+        } else {
+            SystemLogger.warning("App: could not restore rkp prop $name live; intent kept")
+        }
+        return ok
+    }
+
+    /**
+     * Re-resolve and push after rkp.json changed, so the hook's delete-intent set (pushed as the
+     * config's `rkpDeleted`) matches the file again. Nothing else would: the DATA_DIR watcher only
+     * fires for config.json and keyboxes, so without this a fresh delete intent would not reach the
+     * hook until some unrelated push, and until then a reasserted property (#262) would read as a
+     * genuine rkp_only=true and never be reported for a lazy re-delete. Safe to call from the
+     * `@Synchronized` delete/restore: the monitor is reentrant, and by here rkp.json is already
+     * written, so the push carries the new intent set. [why] only labels the line in the log.
+     */
+    private fun pushRkpIntents(why: String) {
+        SystemLogger.info("App: re-pushing config after rkp intent change ($why)")
+        resolveAndPush()
     }
 
     /** Where the inject binary + native libs live: args[0], else the dex dir, else default. */

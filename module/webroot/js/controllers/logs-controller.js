@@ -15,7 +15,7 @@ const MAX_KEPT = 4000;
 const SAVE_DIR_KEY = "teesim.logs.dir";
 const DEFAULT_SAVE_DIR = "/sdcard/Download";
 
-// The default export filename: TEESimulator-<version>-<variant>-<timestamp>.log. The module
+// The default export filename: TEESimulator-report-<version>-<variant>-<timestamp>.zip. The module
 // version already embeds the variant, e.g. "v4.0 (17-0375393-debug)"; sanitize it into a
 // filename-safe token (drop parens, spaces/others -> dashes) and append a local timestamp.
 function defaultLogName(version) {
@@ -25,7 +25,7 @@ function defaultLogName(version) {
       .trim()
       .replace(/[^A-Za-z0-9._-]+/g, "-")
       .replace(/^-+|-+$/g, "") || "unknown";
-  return `TEESimulator-${tag}-${timestamp()}.log`;
+  return `TEESimulator-report-${tag}-${timestamp()}.zip`;
 }
 
 function timestamp() {
@@ -47,7 +47,11 @@ export function create(mount) {
   let inFlight = false;
   let moduleVer = ""; // cached at load so the default save filename is ready without an await
 
-  let filter = { minLevel: "V", tags: new Set(), text: "" };
+  // Default view: our own lines, at INFO and above. The collector keeps AndroidRuntime and the
+  // injected process's own tags (keystore2, etc.) too, and V/D never gets dropped from the file
+  // (see LogTail.kt) — but a first look at the panel wants the daemon's own decisions, not the
+  // seams beneath them or another process's chatter. Both stay one tap away in the filter sheet.
+  let filter = { minLevel: "I", tags: new Set(["TEESimulator"]), text: "" };
   let filterHost = null;    // content element inside the filter sheet
   let filterOverlay = null; // { close } while the sheet is open
   let saveHost = null;      // content element inside the save sheet
@@ -103,11 +107,11 @@ export function create(mount) {
   }
 
   // ---- save sheet -------------------------------------------------------
-  // The Save button opens this sheet; the sheet's own Save click is the gesture that POSTs
-  // the log text to the daemon, which (as root) writes it to the chosen folder/name and
-  // returns the final path. The folder is remembered in localStorage for next time.
+  // The Save button opens this sheet; the sheet's own Save click asks the daemon to assemble a bug
+  // report — the whole on-disk rotation (not this view's 4000-line ring), the config, a property
+  // allowlist and the installed-module list, redacted — and write it to the chosen folder/name as
+  // root. The folder is remembered in localStorage for next time.
   function openSaveSheet() {
-    if (!lines.length) { toast("No logs to save"); return; }
     const dir = localStorage.getItem(SAVE_DIR_KEY) || DEFAULT_SAVE_DIR;
     const name = defaultLogName(moduleVer);
     saveHost = document.createElement("div");
@@ -117,20 +121,20 @@ export function create(mount) {
 
   const saveActions = {
     async save(dir, name) {
-      const text = lines.map((l) => l.text).join("\n");
-      if (!text) { toast("No logs to save"); return; }
       const folder = (dir || "").trim() || DEFAULT_SAVE_DIR;
       try {
-        const res = await keyAdmin("logsWrite", { dir: folder, name, text });
+        // No `text` argument: the daemon writes its own files, so an empty view (a filter that
+        // matches nothing, a panel just opened) still exports the full log.
+        const res = await keyAdmin("report", { dir: folder, name });
         if (res && res.ok) {
           localStorage.setItem(SAVE_DIR_KEY, folder);
-          toast("Saved to " + res.path);
+          toast("Saved " + (res.bytes ? Math.round(res.bytes / 1024) + " KB to " : "to ") + res.path);
           if (saveOverlay) saveOverlay.close();
         } else {
           toast("Save failed: " + ((res && res.error) || "unknown error"));
         }
       } catch (e) {
-        console.error("[logs.save] write failed:", e);
+        console.error("[logs.save] report failed:", e);
         toast("Save failed: " + (e && e.message ? e.message : String(e)));
       }
     },
@@ -150,7 +154,11 @@ export function create(mount) {
       render();
     },
     setText(v) { filter.text = v; render(); },
-    reset() { filter = { minLevel: "V", tags: new Set(), text: "" }; renderFilterSheet(); render(); },
+    reset() {
+      filter = { minLevel: "I", tags: new Set(["TEESimulator"]), text: "" };
+      renderFilterSheet();
+      render();
+    },
     close() { closeFilters(); },
   };
 
