@@ -310,6 +310,7 @@ impl Ta {
 }
 
 /// A failed per-method operation: a KeyMint error code plus a message.
+#[derive(Debug)]
 pub struct OpError {
     pub code: i32,
     pub msg: String,

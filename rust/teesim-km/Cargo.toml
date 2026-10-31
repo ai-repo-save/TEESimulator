@@ -7,9 +7,9 @@ publish = false
 description = "In-process KeyMint TA (kmr-ta) and C ABI for the native interceptor."
 
 [lib]
-# A static library only: it is linked into the interceptor's shared object, which
-# resolves BoringSSL at runtime inside keystore2, so nothing here links libcrypto.
-crate-type = ["staticlib"]
+# staticlib is what the interceptor links; rlib exists so the host conformance tests under tests/
+# can drive the TA directly. Nothing here links libcrypto at build time either way.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 kmr-ta = { path = "../../third_party/keymint/ta" }
@@ -31,4 +31,9 @@ base64 = "0.22"
 
 # X.509 assembly for patch mode: re-signing the real hardware attestation leaf under the keybox.
 # Pinned to the versions the vendored kmr-ta/kmr-common already use; x509-cert re-exports der/spki.
+x509-cert = "0.2"
+
+[dev-dependencies]
+# The host conformance tests decode the records this crate produces.
+kmr-wire = { path = "../../third_party/keymint/wire" }
 x509-cert = "0.2"

@@ -155,6 +155,13 @@ interceptor's job, and it differs by platform:
 Build one ABI with [`rust/build.sh`](../build.sh) (`ABI=arm64-v8a API=34 ./build.sh` by default);
 it drives `cargo ndk`.
 
+## Host tests
+
+`rust/test-host.sh` builds BoringSSL for the host and runs `rust/teesim-km/tests/conformance.rs`,
+which drives this TA directly with a fixed test keybox and pinned attestation versions and asserts
+the record against the Keymaster/KeyMint contract (version pair, ORIGIN, CREATION_DATETIME,
+MODULE_HASH gate, leaf validity, challenge/application id). It needs no device.
+
 ## C ABI
 
 The interceptors are C++; the TA is Rust; CBOR lives only on the Rust side. The

@@ -67,6 +67,12 @@ jobs:
           rustup component add clippy
           ./rust/build.sh clippy
 
+      # The TA is the binary that produces the attestation record, so it is tested on the host with
+      # a fixed test keybox and pinned versions: no device, no interceptor. rust/test-host.sh builds
+      # the host BoringSSL the backend links against, then runs the tests under rust/teesim-km/tests.
+      - name: Host conformance tests
+        run: ./rust/test-host.sh
+
       - name: Build the module
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
