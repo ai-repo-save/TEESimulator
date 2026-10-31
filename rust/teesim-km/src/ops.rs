@@ -298,14 +298,26 @@ impl Ta {
             _ => None,
         });
         let prefer_ec = params.iter().any(|p| matches!(p, KeyParam::Algorithm(kmr_wire::keymint::Algorithm::Ec)));
-        let batch_expire = self.sign_info.batch_not_after_ms(prefer_ec).unwrap_or(0);
+        let batch_expire = self.sign_info.batch_not_after_ms(prefer_ec);
+        if batch_expire.is_none() {
+            log::warn!(
+                "ensure_keymaster_leaf_validity: the keybox batch certificate has no readable \
+                 notAfter; CERTIFICATE_NOT_AFTER falls back to the epoch"
+            );
+        }
         if !has_not_before {
-            let ms = active.or(creation).unwrap_or(0);
-            params.push(KeyParam::CertificateNotBefore(DateTime { ms_since_epoch: ms }));
+            let ms = active.or(creation);
+            if ms.is_none() {
+                log::warn!(
+                    "ensure_keymaster_leaf_validity: neither ACTIVE_DATETIME nor CREATION_DATETIME \
+                     is present; CERTIFICATE_NOT_BEFORE falls back to the epoch"
+                );
+            }
+            params.push(KeyParam::CertificateNotBefore(DateTime { ms_since_epoch: ms.unwrap_or(0) }));
         }
         if !has_not_after {
             params.push(KeyParam::CertificateNotAfter(DateTime {
-                ms_since_epoch: usage_expire.unwrap_or(batch_expire),
+                ms_since_epoch: usage_expire.or(batch_expire).unwrap_or(0),
             }));
         }
     }
