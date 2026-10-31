@@ -21,7 +21,7 @@ extern "C" {
 const char *teesim_log_context(void);
 void teesim_log_set_context(const char *ctx);
 // The ErrorCode name for a KeyMint status, or "?" for a code outside the AIDL. Never null, so it can
-// be passed straight to a %s. Defined alongside the context in common/log_context.cpp.
+// be passed straight to a %s. Defined with the tag tables in common/km_names.cpp.
 const char *teesim_km_err_name(int32_t code);
 
 // --- The emitter -------------------------------------------------------------

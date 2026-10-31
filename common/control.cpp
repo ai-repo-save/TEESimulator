@@ -279,7 +279,8 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       s.uid_pkg_strings.resize(s.uids.size());
       s.uid_pkg_ptrs.reserve(s.uid_pkg_strings.size());
       for (const auto &p : s.uid_pkg_strings) s.uid_pkg_ptrs.push_back(p.c_str());
-      // uidAppIds[] is parallel to uids[]; empty / missing means keystore1 synthesises from uidPackages.
+      // uidAppIds[] is parallel to uids[]; empty / missing means keystore1 attests the AOSP
+      // PackageManager-failure placeholder instead of a package list.
       if (const tjson::Value *uid_app_ids = pj.get("uidAppIds")) {
         for (size_t j = 0; j < uid_app_ids->size(); ++j) {
           std::vector<uint8_t> der;

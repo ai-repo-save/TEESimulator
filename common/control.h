@@ -65,11 +65,11 @@ typedef struct {
   const int32_t *uids;  // caller-uid match (may be shorter or longer than packages)
   int n_uids;
   // Parallel to uids[]: the package name behind each uid, or "" for a raw uid:N / auto-included one.
-  // keystore1 rebuilds an attestation application id from it, since downstream of that hook the
-  // caller's own is already gone. NULL means "no names known".
+  // NULL means "no names known".
   const char *const *uid_packages;
   // Parallel to uids[]: official AttestationApplicationId DER from the daemon's PackageManager.
-  // NULL / zero length means keystore1 falls back to synthesising from uid_packages[].
+  // NULL / zero length means keystore1 has none for that uid and attests the AOSP
+  // PackageManager-failure placeholder ("UnknownPackage") instead.
   const uint8_t *const *uid_app_ids;
   const size_t *uid_app_id_lens;
 } TsProfile;

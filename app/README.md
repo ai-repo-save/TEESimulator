@@ -67,17 +67,18 @@ Once the framework is up, `App.main` wires the daemon and enters `Looper.loop()`
    **`Scope`** is the one place a profile's `apps[]` becomes the wire arrays the native router
    matches on — `packages[]` (attestation package-name match, kept verbatim so a not-yet-installed
    name still matches once the app lands) with `packageUsers[]` beside it, and `uids[]` (caller-uid
-   match, the effective set with no `-1`) with `uidPackages[]` beside it. An `apps[]` entry is a
-   package name, the same name suffixed `@<user>` for an app inside another Android user, an advanced
-   `uid:N` token that targets a caller uid directly (for a shared-uid app or one whose package is
-   unknown), or — per profile — `autoIncludeNewApps`, which folds in only apps installed AFTER a
-   one-time baseline snapshot (`known_packages.json`, seeded from the currently-installed set the
-   first time the daemon runs), so genuinely new apps are covered without an edit while existing apps
-   are never silently captured. Every entry is logged as it resolves
-   (`Scope[<id>]: 'com.foo' -> uid 10123 (user 0)`, `-> NOT INSTALLED for user 10 (dropped)`), and a
-   uid whose app id is below the app range (a `shell`/`system_server`-style uid, in any user) is
-   flagged with a warning — the instrumentation that makes "which app is actually intercepted"
-   answerable from the log.
+   match, the effective set with no `-1`) with `uidPackages[]` (the package behind each uid) and
+   `uidAppIds[]` (the AttestationApplicationId DER the keystore1 path attests) beside it. An
+   `apps[]` entry is a package name, the same name suffixed `@<user>` for an app inside another
+   Android user, an advanced `uid:N` token that targets a caller uid directly (for a shared-uid app
+   or one whose package is unknown), or — per profile — `autoIncludeNewApps`, which folds in only
+   apps installed AFTER a one-time baseline snapshot (`known_packages.json`, seeded from the
+   currently-installed set the first time the daemon runs), so genuinely new apps are covered
+   without an edit while existing apps are never silently captured. Every entry is logged as it
+   resolves (`Scope[<id>]: 'com.foo' -> uid 10123 (user 0)`, `-> NOT INSTALLED for user 10
+   (dropped)`), and a uid whose app id is below the app range (a `shell`/`system_server`-style uid,
+   in any user) is flagged with a warning — the instrumentation that makes "which app is actually
+   intercepted" answerable from the log.
 
    **Android users.** A work profile or a secondary user runs its own copy of an app under its own
    uid (`userId * 100000 + appId`), so it is a separate caller to keystore and is targeted separately:
