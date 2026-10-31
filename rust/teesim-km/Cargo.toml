@@ -34,6 +34,9 @@ base64 = "0.22"
 x509-cert = "0.2"
 
 [dev-dependencies]
-# The host conformance tests decode the records this crate produces.
+# The host conformance tests decode the records this crate produces, and verify signatures with the
+# attested public key. openssl reuses the openssl-sys/BoringSSL the crate already links.
 kmr-wire = { path = "../../third_party/keymint/wire" }
 x509-cert = "0.2"
+openssl = "0.10"
+log = "0.4"

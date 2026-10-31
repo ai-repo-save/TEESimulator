@@ -126,7 +126,7 @@ fn parse_algo(node: roxmltree::Node, algo: SigningAlgorithm) -> Result<AlgoInfo,
         .ok_or_else(|| format!("{name}: missing PrivateKey"))?
         .text()
         .ok_or_else(|| format!("{name}: empty PrivateKey"))?;
-    let key_der = decode_pem(priv_pem)?;
+    let key_der = normalize_private_key(decode_pem(priv_pem)?);
 
     let mut chain = Vec::new();
     for cert in node.descendants().filter(|n| n.has_tag_name("Certificate")) {
@@ -145,6 +145,54 @@ fn parse_algo(node: roxmltree::Node, algo: SigningAlgorithm) -> Result<AlgoInfo,
         }
     };
     Ok(AlgoInfo { key, chain })
+}
+
+/// Keyboxes carry their private keys either in PKCS#8 (`BEGIN PRIVATE KEY`) or in the algorithm's
+/// own encoding (`BEGIN RSA PRIVATE KEY`, `BEGIN EC PRIVATE KEY`). The BoringSSL backend parses the
+/// algorithm-specific form only, and it parses lazily — at the first signature — so a PKCS#8 keybox
+/// would otherwise fail every attestation with an opaque `BoringSslError`. Unwrap the PKCS#8
+/// PrivateKeyInfo to its inner key here, where the failure is a readable keybox error.
+fn normalize_private_key(der: Vec<u8>) -> Vec<u8> {
+    // PrivateKeyInfo ::= SEQUENCE { version INTEGER, algorithm SEQUENCE, privateKey OCTET STRING }
+    // RSAPrivateKey ::= SEQUENCE { version INTEGER, modulus INTEGER, ... }
+    // ECPrivateKey  ::= SEQUENCE { version INTEGER, privateKey OCTET STRING, ... }
+    // The second element tells them apart: a SEQUENCE means PKCS#8, an INTEGER means the key is
+    // already in its own encoding.
+    fn tlv(der: &[u8], at: usize) -> Option<(u8, usize, usize)> {
+        let tag = *der.get(at)?;
+        let mut i = at + 1;
+        let first = *der.get(i)? as usize;
+        i += 1;
+        let len = if first & 0x80 == 0 {
+            first
+        } else {
+            let n = first & 0x7f;
+            let mut len = 0usize;
+            for _ in 0..n {
+                len = (len << 8) | *der.get(i)? as usize;
+                i += 1;
+            }
+            len
+        };
+        Some((tag, i, i + len))
+    }
+
+    let Some((0x30, seq_start, seq_end)) = tlv(&der, 0) else { return der };
+    let Some((_, _, version_end)) = tlv(&der, seq_start) else { return der };
+    let Some((second_tag, _, _)) = tlv(&der, version_end) else { return der };
+    if second_tag != 0x30 {
+        return der;
+    }
+    // Walk to the OCTET STRING that holds the algorithm-specific key.
+    let mut at = version_end;
+    while at < seq_end {
+        let Some((tag, value_start, value_end)) = tlv(&der, at) else { return der };
+        if tag == 0x04 {
+            return der[value_start..value_end].to_vec();
+        }
+        at = value_end;
+    }
+    der
 }
 
 /// Strip PEM armor and all whitespace, then base64-decode.
