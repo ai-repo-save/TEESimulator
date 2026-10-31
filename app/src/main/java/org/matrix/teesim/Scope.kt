@@ -197,9 +197,8 @@ object Scope {
             when (x.kind) {
                 Kind.PACKAGE -> {
                     uids.add(x.uid)
-                    // The uid -> package pairing the legacy keystore1 path needs: downstream of
-                    // that hook the caller's attestation application id is gone, so it rebuilds one
-                    // from this name. It must be carried explicitly, never inferred from array
+                    // The uid -> package pairing the log context of both interceptors names a
+                    // request under. It must be carried explicitly, never inferred from array
                     // position — packages[] and uids[] have long since stopped lining up 1:1.
                     x.pkg?.let { uidPackages[x.uid] = it }
                     if (!quiet) {
