@@ -17,12 +17,7 @@
 #include <binder/Parcel.h>
 
 #include <openssl/bytestring.h>
-#include <openssl/ec.h>
-#include <openssl/ec_key.h>
-#include <openssl/evp.h>
 #include <openssl/mem.h>
-#include <openssl/nid.h>
-#include <openssl/rsa.h>
 #include <openssl/x509.h>
 
 #include <algorithm>
@@ -32,7 +27,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <vector>
 
 #include "control.h"
@@ -116,7 +110,6 @@ enum {
   ALGORITHM_AES = 32,
   ALGORITHM_TRIPLE_DES = 33,
   ALGORITHM_HMAC = 128,
-  KEY_FORMAT_PKCS8 = 1,
   KS_NO_ERROR = 1,
   KS_SYSTEM_ERROR = 4,
   KS_UID_SELF = -1,
@@ -142,7 +135,6 @@ const String16 kServiceDescriptor("android.security.keystore.IKeystoreService");
 
 // A simulated key, keyed by (uid, alias).
 struct PendingKey {
-  std::vector<uint8_t> pkcs8;   // private key, PKCS#8 DER
   std::vector<uint8_t> spki;    // public key, SubjectPublicKeyInfo DER
   std::vector<uint8_t> ta_blob; // key imported into the TA, for signing operations
   std::vector<std::vector<uint8_t>> certs;  // attestation chain from the single mint
@@ -184,8 +176,9 @@ TaPtr WrapTa(Ta* ta) {
   });
 }
 
-// A configured profile: its TA and the target uids, each mapped to its package
-// name (needed to synthesise the attestation application id).
+// A configured profile: its TA, the target uids, and each uid's package name (for the log) plus
+// the daemon-supplied AttestationApplicationId DER, which keystore1 cannot rebuild downstream of
+// this hook.
 struct Profile {
   std::string id;
   TaPtr ta;
@@ -412,24 +405,26 @@ void ReplyStatus(Parcel* reply, int32_t status) {
   reply->writeInt32(status);
 }
 
+bool HasTag(const std::vector<KmParam>& params, uint32_t tag) {
+  for (const auto& p : params)
+    if (p.tag == tag) return true;
+  return false;
+}
+
 // Tags Keystore1 would have bound, plus the ApplicationId the daemon gathered.
 // X.509 notBefore/notAfter are KeyMint-only tags; teesim-km fills them from
 // IKeymasterDevice.hal attestKey validity rules.
 void AddRequiredTags(std::vector<KmParam>& params, int uid,
                      std::vector<uint8_t>& app_id_store, bool with_attestation) {
-  auto has = [&](uint32_t tag) {
-    for (const auto& p : params)
-      if (p.tag == tag) return true;
-    return false;
-  };
   int64_t now_ms = static_cast<int64_t>(time(nullptr)) * 1000;
-  if (!has(TAG_CREATION_DATETIME))
+  if (!HasTag(params, TAG_CREATION_DATETIME))
     params.push_back({TAG_CREATION_DATETIME, now_ms, nullptr, 0});
-  if (ParamInt(params, TAG_ALGORITHM, ALGORITHM_EC) == ALGORITHM_EC && !has(TAG_EC_CURVE)) {
+  if (ParamInt(params, TAG_ALGORITHM, ALGORITHM_EC) == ALGORITHM_EC &&
+      !HasTag(params, TAG_EC_CURVE)) {
     int64_t sz = ParamInt(params, TAG_KEY_SIZE, 256);
     params.push_back({TAG_EC_CURVE, sz == 384 ? 2 : sz == 521 ? 3 : sz == 224 ? 0 : 1, nullptr, 0});
   }
-  if (with_attestation && !has(TAG_ATTESTATION_APPLICATION_ID)) {
+  if (with_attestation && !HasTag(params, TAG_ATTESTATION_APPLICATION_ID)) {
     app_id_store = AppIdForUid(uid);
     if (app_id_store.empty()) app_id_store = BuildUnknownPackageApplicationId();
     params.push_back({TAG_ATTESTATION_APPLICATION_ID, 0, app_id_store.data(), app_id_store.size()});
@@ -504,11 +499,9 @@ void WriteKeyCharacteristics(Parcel& p, const std::vector<KmParam>& sw,
   WriteKeymasterArguments(p, hw);
 }
 
-void StoreCreation(PendingKey& k, TsCreationResult* res) {
-  const uint8_t* ptr = nullptr;
-  size_t len = 0;
-  teesim_km_result_key_blob(res, &ptr, &len);
-  k.ta_blob.assign(ptr, ptr + len);
+// Take the certificate chain the TA returned. The leaf carries the public key the caller
+// fetches with exportKey, so a leaf that does not parse leaves nothing to serve.
+bool StoreChain(PendingKey& k, TsCreationResult* res) {
   k.certs.clear();
   size_t n = teesim_km_result_num_certs(res);
   for (size_t i = 0; i < n; ++i) {
@@ -517,14 +510,26 @@ void StoreCreation(PendingKey& k, TsCreationResult* res) {
     teesim_km_result_cert(res, i, &c, &cl);
     k.certs.emplace_back(c, c + cl);
   }
-  if (!k.certs.empty()) ExtractSpkiFromCert(k.certs[0].data(), k.certs[0].size(), k.spki);
-  StoreCharsFromResult(k, res);
+  if (k.certs.empty()) {
+    LOGE("StoreChain: FAILED, the TA returned no certificate for the key");
+    return false;
+  }
+  if (!ExtractSpkiFromCert(k.certs[0].data(), k.certs[0].size(), k.spki)) {
+    LOGE("StoreChain: FAILED, the leaf certificate does not parse; there is no public key to "
+         "export");
+    k.certs.clear();
+    return false;
+  }
+  return true;
 }
 
-bool HasTag(const std::vector<KmParam>& params, uint32_t tag) {
-  for (const auto& p : params)
-    if (p.tag == tag) return true;
-  return false;
+bool StoreCreation(PendingKey& k, TsCreationResult* res) {
+  const uint8_t* ptr = nullptr;
+  size_t len = 0;
+  teesim_km_result_key_blob(res, &ptr, &len);
+  k.ta_blob.assign(ptr, ptr + len);
+  StoreCharsFromResult(k, res);
+  return StoreChain(k, res);
 }
 
 // One TA generate_key per alias. A second generate_key would change the public
@@ -534,22 +539,10 @@ bool MintOnce(PendingKey& k, int uid, const std::vector<KmParam>& extra, bool wi
   if (!k.ta_blob.empty()) return true;
   TsCreationResult* res = ImportKey(k, uid, extra, with_attestation);
   if (!res) return false;
-  StoreCreation(k, res);
+  bool stored = StoreCreation(k, res);
   teesim_km_free_result(res);
-  return true;
-}
-
-bool StoreAttestChain(PendingKey& k, TsCreationResult* res) {
-  k.certs.clear();
-  size_t n = teesim_km_result_num_certs(res);
-  for (size_t i = 0; i < n; ++i) {
-    const uint8_t* c = nullptr;
-    size_t cl = 0;
-    teesim_km_result_cert(res, i, &c, &cl);
-    k.certs.emplace_back(c, c + cl);
-  }
-  if (!k.certs.empty()) ExtractSpkiFromCert(k.certs[0].data(), k.certs[0].size(), k.spki);
-  return !k.certs.empty();
+  if (!stored) k.ta_blob.clear();  // nothing was served; a later call mints again
+  return stored;
 }
 
 // Keystore1 attestKey: same key, new attestation record (challenge / ApplicationId).
@@ -571,7 +564,7 @@ bool AttestExisting(PendingKey& k, int uid, const std::vector<KmParam>& extra) {
     LOGE("AttestExisting: TA attest_key failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return false;
   }
-  bool ok = StoreAttestChain(k, res);
+  bool ok = StoreChain(k, res);
   teesim_km_free_result(res);
   return ok;
 }
@@ -965,6 +958,7 @@ bool HandleExist(int calling_uid, Parcel& in, Parcel* reply) {
       return false;
     }
   }
+  LOGD("exist: answered from the simulated keys alias=%s uid=%d", String8(alias).c_str(), uid);
   ReplyStatus(reply, KS_NO_ERROR);
   return true;
 }
