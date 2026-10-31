@@ -24,7 +24,7 @@ The root of trust — verified-boot key, verified-boot state, device-locked flag
 ## Requirements
 
 * *Android 10 or newer*
-* A *64-bit* device — *arm64-v8a* or *x86_64* (the keystore daemon is 64-bit)
+* A *64-bit* device — this fork builds *arm64-v8a* only (the keystore daemon is 64-bit)
 * Root (Magisk, KernelSU, or APatch)
 
 ## Installation
@@ -110,7 +110,7 @@ export ANDROID_NDK_HOME=/path/to/android/ndk    # or the newest NDK under $ANDRO
 ./gradlew zipRelease                            # -> out/TEESimulator-<version>-<count>-<hash>-Release.zip
 ```
 
-The whole build is one Gradle graph. `zipRelease` (or `zipDebug`, which bundles extra logging) builds the Rust TA, both native interceptors for `arm64-v8a` and `x86_64` (via CMake `externalNativeBuild`), and the control daemon's dex, then assembles the flashable module. With a device attached, `./gradlew installMagisk` (or `installKsu` / `installApatch`) pushes and installs it; append `AndReboot` to reboot after, and set `ANDROID_SERIAL=<serial>` to pick a device when several are connected.
+The whole build is one Gradle graph. `zipRelease` (or `zipDebug`, which bundles extra logging) builds the Rust TA and both native interceptors for `arm64-v8a` (via CMake `externalNativeBuild`), and the control daemon's dex, then assembles the flashable module. With a device attached, `./gradlew installMagisk` (or `installKsu` / `installApatch`) pushes and installs it; append `AndReboot` to reboot after, and set `ANDROID_SERIAL=<serial>` to pick a device when several are connected.
 
 ## Project layout
 
