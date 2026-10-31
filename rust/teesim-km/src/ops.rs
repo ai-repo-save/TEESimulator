@@ -299,25 +299,22 @@ impl Ta {
         });
         let prefer_ec = params.iter().any(|p| matches!(p, KeyParam::Algorithm(kmr_wire::keymint::Algorithm::Ec)));
         let batch_expire = self.sign_info.batch_not_after_ms(prefer_ec);
-        if batch_expire.is_none() {
-            log::warn!(
-                "ensure_keymaster_leaf_validity: the keybox batch certificate has no readable \
-                 notAfter; CERTIFICATE_NOT_AFTER falls back to the epoch"
-            );
-        }
         if !has_not_before {
-            let ms = active.or(creation);
-            if ms.is_none() {
-                log::warn!(
-                    "ensure_keymaster_leaf_validity: neither ACTIVE_DATETIME nor CREATION_DATETIME \
-                     is present; CERTIFICATE_NOT_BEFORE falls back to the epoch"
-                );
-            }
-            params.push(KeyParam::CertificateNotBefore(DateTime { ms_since_epoch: ms.unwrap_or(0) }));
+            // ensure_creation_datetime() has already stamped CREATION_DATETIME, so this resolves;
+            // IKeymasterDevice.hal prefers ACTIVE_DATETIME when the request carries one.
+            let ms = active.or(creation).unwrap_or(0);
+            params.push(KeyParam::CertificateNotBefore(DateTime { ms_since_epoch: ms }));
         }
         if !has_not_after {
+            let not_after = usage_expire.or(batch_expire);
+            if not_after.is_none() {
+                log::warn!(
+                    "ensure_keymaster_leaf_validity: neither USAGE_EXPIRE_DATETIME nor a readable \
+                     keybox batch notAfter is present; CERTIFICATE_NOT_AFTER falls back to the epoch"
+                );
+            }
             params.push(KeyParam::CertificateNotAfter(DateTime {
-                ms_since_epoch: usage_expire.or(batch_expire).unwrap_or(0),
+                ms_since_epoch: not_after.unwrap_or(0),
             }));
         }
     }
